@@ -37,9 +37,9 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--help" => { println!("configured-deploy --installable FLAKE#CONFIG --plan FILE [--target-host update@HOST] [--ssh-port PORT] [--no-reboot]"); return Ok(()); }
+            "--help" => { println!("configured-deploy --installable FLAKE#CONFIG --plan FILE [--target-host update@HOST] [--ssh-port PORT] [--known-hosts FILE] [--no-reboot]"); return Ok(()); }
             "--no-reboot" => no_reboot = true,
-            "--installable" | "--plan" | "--nix" | "--target-host" | "--ssh-port" => { values.insert(arg.as_str(), iter.next().ok_or("missing configured update option value")?.clone()); }
+            "--installable" | "--plan" | "--nix" | "--target-host" | "--ssh-port" | "--known-hosts" => { values.insert(arg.as_str(), iter.next().ok_or("missing configured update option value")?.clone()); }
             _ => return Err(format!("unknown configured update option {arg}")),
         }
     }
@@ -61,6 +61,11 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     if host.is_empty() || host.starts_with('-') { return Err("invalid update target".into()); }
     let target = format!("{user}@{}", host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host));
     if plan.public_key.lines().count() != 1 || !(plan.public_key.starts_with("ssh-") || plan.public_key.starts_with("ecdsa-")) { return Err("invalid configured update public key".into()); }
+    let known_hosts = values.get("--known-hosts").map(|path| {
+        let path = fs::canonicalize(path).map_err(|e| format!("cannot read verified known-hosts file: {e}"))?;
+        if !path.is_file() { return Err("known-hosts must be a regular file".to_owned()); }
+        Ok(path)
+    }).transpose()?;
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut replacements = BTreeMap::from([("{installable}", installable.to_owned()), ("{host}", plan.host.clone()), ("{target}", target.clone())]);
     if std::env::var_os(&plan.session_environment).is_none() {
@@ -82,6 +87,11 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     let (command, arguments) = auth.split_first().ok_or("missing update authentication command")?;
     let mut ssh_arguments = expanded(&plan.ssh_arguments, &replacements);
     let mut copy_arguments = expanded(&plan.copy_ssh_arguments, &replacements);
+    if let Some(path) = known_hosts {
+        let option = format!("UserKnownHostsFile={}", path.display());
+        ssh_arguments.extend(["-o".into(), option.clone()]);
+        copy_arguments.extend(["-o".into(), option]);
+    }
     if let Some(port) = values.get("--ssh-port") {
         if port.parse::<u16>().ok().filter(|p| *p != 0).is_none() { return Err("invalid SSH port".into()); }
         ssh_arguments.extend(["-p".into(), port.clone()]);
