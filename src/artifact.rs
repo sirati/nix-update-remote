@@ -288,6 +288,15 @@ fn prepare_impl(args: &[String]) -> Result<(String, bool), String> {
         }
         for entry in fs::read_dir(&temporary.0).map_err(error)? {
             let entry = entry.map_err(error)?;
+            // Both uploads are authenticated independently. Randomized
+            // signatures can differ for identical payloads; activation
+            // verifies the retained signatures before selecting this directory.
+            if matches!(entry.file_name().to_str(), Some(
+                "nix.erofs.sig" | "config.toml.sig" | "kernel.sig" |
+                "initrd.sig" | "rescue.sfs.sig" | "network.erofs.sig"
+            )) {
+                continue;
+            }
             if !equal(&entry.path(), &destination.join(entry.file_name()))? {
                 return Err("existing generation differs from verified upload".into());
             }
