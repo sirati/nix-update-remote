@@ -4,6 +4,7 @@ mod artifact;
 mod artifact_client;
 mod authorized_keys;
 mod client;
+mod configured_client;
 mod keygen;
 mod daemon;
 mod generation_client;
@@ -27,6 +28,7 @@ fn run() -> Result<(), String> {
         Some("prepare-erofs") => artifact::prepare(&args[1..]),
         Some("activate-erofs") => artifact::activate(&args[1..]),
         Some("keygen") => keygen::generate(&args[1..]),
+        Some("configured-deploy") => configured_client::deploy(&args[1..]),
         Some("deploy") => client::deploy(&args[1..]),
         Some("daemon") => daemon::run(&args[1..]),
         Some("authorized-keys") => authorized_keys::run(&args[1..]),
