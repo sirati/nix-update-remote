@@ -165,6 +165,10 @@ in
 
     systemd.services.nix-update-remote = {
       description = "Verified NixOS remote switch broker";
+      # Activation runs inside this service. Stopping it during its own update
+      # would kill activation before reporting and replying to the client.
+      restartIfChanged = false;
+      stopIfChanged = false;
       wantedBy = [ "multi-user.target" ];
       after = [ "nix-daemon.service" ];
       serviceConfig = {
@@ -184,6 +188,10 @@ in
             "--update-uid"
             (toString cfg.uid)
             "--report-queue" cfg.reportQueue
+            "--restart-command" "${pkgs.systemd}/bin/systemctl"
+            "--restart-arg" "try-restart"
+            "--restart-arg" "--no-block"
+            "--restart-arg" "nix-update-remote.service"
           ]
           ++ lib.optionals cfg.artifact.enable (
             [ "--artifact-prepare" updaterExe "--artifact-activate" updaterExe "--reboot-command" "${pkgs.systemd}/bin/systemctl" ]
