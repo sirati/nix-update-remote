@@ -1,35 +1,65 @@
 use crate::protocol;
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Options {
     target: String,
     installable: String,
-    signing_key: PathBuf,
+    signing_key: Option<PathBuf>,
+    key_command: Option<PathBuf>,
+    key_args: Vec<String>,
     impure: bool,
+    post_command: Option<PathBuf>,
+    post_args: Vec<String>,
+    ssh_args: Vec<String>,
 }
 
 pub fn deploy(args: &[String]) -> Result<(), String> {
     let options = parse(args)?;
     validate_target(&options.target)?;
-    validate_key(&options.signing_key)?;
-    let system = build(&options)?;
-    run(
-        Command::new("nix")
-            .args([
-                "--extra-experimental-features",
-                "nix-command",
-                "store",
-                "sign",
-                "--recursive",
-                "--key-file",
-            ])
-            .arg(&options.signing_key)
-            .arg(&system),
-        "signing closure",
-    )?;
+    if let Some(key) = &options.signing_key {
+        validate_key(key)?;
+    }
+    let roots = Roots::create()?;
+    let system = build(&options, &roots.0.join("system"))?;
+    let mut signing = Command::new("nix");
+    signing.args([
+        "--extra-experimental-features",
+        "nix-command",
+        "store",
+        "sign",
+        "--recursive",
+        "--key-file",
+    ]);
+    if let Some(key) = &options.signing_key {
+        run(signing.arg(key).arg(&system), "signing closure")?;
+    } else {
+        let mut provider =
+            Command::new(options.key_command.as_ref().ok_or("missing key provider")?)
+                .args(&options.key_args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        let input = provider
+            .stdout
+            .take()
+            .ok_or("missing key provider output")?;
+        let signed = signing
+            .arg("/proc/self/fd/0")
+            .arg(&system)
+            .stdin(Stdio::from(input))
+            .status()
+            .map_err(|e| e.to_string());
+        let provided = provider.wait().map_err(|e| e.to_string())?;
+        if !provided.success() || !signed?.success() {
+            return Err("signing closure with key provider failed".into());
+        }
+    }
     let store = store_uri(&options.target)?;
     run(
         Command::new("nix")
@@ -43,29 +73,98 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
             .arg(&system),
         "copying closure",
     )?;
-    apply(&options.target, &system)
+    apply(&options.target, &system, &options.ssh_args)?;
+    if let Some(command) = &options.post_command {
+        run(
+            Command::new(command).args(&options.post_args),
+            "post-update operation",
+        )?;
+    }
+    Ok(())
+}
+
+struct Roots(PathBuf);
+impl Roots {
+    fn create() -> Result<Self, String> {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos();
+        let path = std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(format!(
+                "system-update-roots-{}-{stamp}",
+                std::process::id()
+            ));
+        fs::create_dir(&path).map_err(|e| e.to_string())?;
+        let roots = Self(path);
+        fs::set_permissions(&roots.0, fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+        eprintln!(
+            "Retaining registered GC roots in {} until update completion",
+            roots.0.display()
+        );
+        Ok(roots)
+    }
+}
+impl Drop for Roots {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 fn parse(args: &[String]) -> Result<Options, String> {
     let mut target = None;
     let mut installable = None;
     let mut signing_key = None;
+    let mut key_command = None;
+    let mut key_args = Vec::new();
     let mut impure = false;
+    let mut post_command = None;
+    let mut post_args = Vec::new();
+    let mut ssh_args = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--target" => target = iter.next().cloned(),
             "--installable" => installable = iter.next().cloned(),
             "--signing-key" => signing_key = iter.next().map(PathBuf::from),
+            "--key-command" => {
+                key_command = Some(PathBuf::from(iter.next().ok_or("missing key command")?))
+            }
+            "--key-arg" => key_args.push(iter.next().ok_or("missing key argument")?.clone()),
             "--impure" => impure = true,
+            "--ssh-arg" => ssh_args.push(iter.next().ok_or("missing SSH argument")?.clone()),
+            "--post-command" => {
+                post_command = Some(PathBuf::from(
+                    iter.next().ok_or("missing post-update command")?,
+                ))
+            }
+            "--post-arg" => {
+                post_args.push(iter.next().ok_or("missing post-update argument")?.clone())
+            }
             _ => return Err(format!("unknown deploy argument: {arg}")),
         }
+    }
+    if !post_args.is_empty() && post_command.is_none() {
+        return Err("post-update arguments require --post-command".into());
+    }
+    if signing_key.is_some() == key_command.is_some() {
+        return Err("supply exactly one signing key or key command".into());
+    }
+    if !key_args.is_empty() && key_command.is_none() {
+        return Err("key arguments require --key-command".into());
     }
     Ok(Options {
         target: target.ok_or("missing --target")?,
         installable: installable.ok_or("missing --installable")?,
-        signing_key: signing_key.ok_or("missing --signing-key")?,
+        signing_key,
+        key_command,
+        key_args,
         impure,
+        post_command,
+        post_args,
+        ssh_args,
     })
 }
 
@@ -86,15 +185,18 @@ fn validate_key(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn build(options: &Options) -> Result<PathBuf, String> {
+fn build(options: &Options, root: &Path) -> Result<PathBuf, String> {
     let mut command = Command::new("nix");
-    command.args([
-        "--extra-experimental-features",
-        "nix-command flakes",
-        "build",
-        "--no-link",
-        "--print-out-paths",
-    ]);
+    command
+        .args([
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "build",
+            "--out-link",
+        ])
+        .arg(root)
+        .arg("--print-out-paths");
+
     if options.impure {
         command.arg("--impure");
     }
@@ -124,8 +226,9 @@ fn store_uri(target: &str) -> Result<String, String> {
     Ok(format!("ssh-ng://{user}@{host}"))
 }
 
-fn apply(target: &str, system: &Path) -> Result<(), String> {
+fn apply(target: &str, system: &Path, ssh_args: &[String]) -> Result<(), String> {
     let mut child = Command::new("ssh")
+        .args(ssh_args)
         .args(["--", target, "apply"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

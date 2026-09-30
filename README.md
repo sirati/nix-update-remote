@@ -35,6 +35,14 @@ nix run github:sirati/nix-update-remote -- deploy \
   --impure
 ```
 
+The client keeps registered GC roots in the checkout until activation and any
+configured `--post-command` finish. Pass repeated `--post-arg` values to request
+secret deployment through your secret manager after a successful switch; the
+updater has no dependency on that manager. Instead of `--signing-key`, a
+structured `--key-command` with repeated `--key-arg` values can supply the key
+through a pipe. `keygen NAME` generates an operator key with the private half
+on stdout and the public half on descriptor 3; neither half is written to disk.
+
 `beforeHooks` and `afterHooks` are immutable notification executables, delivered
 asynchronously from a durable queue under the unprivileged hook identity.
 Delivery failures remain queued and never prevent a verified recovery update.
@@ -52,7 +60,7 @@ hook ordering and privilege, and activation.
 instead of signed Nix closures. The same Rust login program and independently
 peer-checked privileged service own both modes. Artifact integrations supply
 only the mutable generation root, trusted public-key file, and immutable
-`nmbl-sign` verifier. The account has no shell or sudo permission. Artifact
+signature verifier. The account has no shell or sudo permission. Artifact
 headers, payload lengths, content hashes, sidecars, staging and atomic selection
 are handled in Rust. Kernel, initrd, configuration, rescue and optional network
 payload signatures are verified before selecting a generation. An unhealthy
