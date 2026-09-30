@@ -1,11 +1,11 @@
 use crate::{protocol, verify};
 use std::fs;
 use std::io::{Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 struct Options {
     socket: PathBuf,
@@ -15,11 +15,14 @@ struct Options {
     static_keys: Vec<String>,
     key_file: Option<PathBuf>,
     update_uid: u32,
-    hook_uid: Option<u32>,
-    hook_gid: Option<u32>,
     before_hooks: Vec<PathBuf>,
     after_hooks: Vec<PathBuf>,
-    hook_path: String,
+    report_queue: PathBuf,
+    artifact_prepare: Option<PathBuf>,
+    artifact_activate: Option<PathBuf>,
+    artifact_prepare_args: Vec<String>,
+    artifact_activate_args: Vec<String>,
+    reboot_command: Option<PathBuf>,
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -52,10 +55,20 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut hook_gid = None;
     let mut before_hooks = Vec::new();
     let mut after_hooks = Vec::new();
-    let mut hook_path = "/run/current-system/sw/bin".to_owned();
+    let mut report_queue = PathBuf::from("/persistent/system-update-reports");
+    let mut artifact_prepare = None;
+    let mut artifact_activate = None;
+    let mut reboot_command = None;
+    let mut artifact_prepare_args = Vec::new();
+    let mut artifact_activate_args = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "--artifact-prepare-arg" => artifact_prepare_args.push(next_value(&mut iter, arg)?),
+            "--artifact-activate-arg" => artifact_activate_args.push(next_value(&mut iter, arg)?),
+            "--artifact-prepare" => artifact_prepare = Some(next_path(&mut iter, arg)?),
+            "--artifact-activate" => artifact_activate = Some(next_path(&mut iter, arg)?),
+            "--reboot-command" => reboot_command = Some(next_path(&mut iter, arg)?),
             "--socket" => socket = next_path(&mut iter, arg)?,
             "--nix" => nix = Some(next_path(&mut iter, arg)?),
             "--nix-env" => nix_env = Some(next_path(&mut iter, arg)?),
@@ -85,11 +98,26 @@ fn parse(args: &[String]) -> Result<Options, String> {
             }
             "--before-hook" => before_hooks.push(next_path(&mut iter, arg)?),
             "--after-hook" => after_hooks.push(next_path(&mut iter, arg)?),
-            "--hook-path" => hook_path = next_value(&mut iter, arg)?,
+            "--hook-path" => {
+                let _ = next_value(&mut iter, arg)?;
+            }
+            "--report-queue" => report_queue = next_path(&mut iter, arg)?,
             _ => return Err(format!("unknown daemon argument: {arg}")),
         }
     }
-    if static_keys.is_empty() && key_file.is_none() {
+    if artifact_prepare.is_some() != artifact_activate.is_some() {
+        return Err("artifact backend requires prepare and activate executables".into());
+    }
+    for command in artifact_prepare
+        .iter()
+        .chain(artifact_activate.iter())
+        .chain(reboot_command.iter())
+    {
+        if !command.starts_with("/nix/store/") || !command.is_absolute() {
+            return Err("backend commands must be immutable Nix store executables".into());
+        }
+    }
+    if artifact_prepare.is_none() && static_keys.is_empty() && key_file.is_none() {
         return Err("daemon requires a trust key".into());
     }
     if (!before_hooks.is_empty() || !after_hooks.is_empty())
@@ -113,11 +141,14 @@ fn parse(args: &[String]) -> Result<Options, String> {
         static_keys,
         key_file,
         update_uid: update_uid.ok_or("missing --update-uid")?,
-        hook_uid,
-        hook_gid,
         before_hooks,
         after_hooks,
-        hook_path,
+        report_queue,
+        artifact_prepare,
+        artifact_activate,
+        artifact_prepare_args,
+        artifact_activate_args,
+        reboot_command,
     })
 }
 
@@ -139,26 +170,47 @@ fn next_path<'a>(
 
 fn handle(mut stream: UnixStream, options: &Options) {
     let result = apply_request(&mut stream, options);
-    let response = match result {
-        Ok(path) => format!("OK {}\n", path.display()),
+    let response = match &result {
+        Ok((path, _)) => format!("OK {}\n", path.display()),
         Err(error) => {
             eprintln!("nix-update-remote: rejected update: {error}");
             "ERR update rejected\n".into()
         }
     };
     let _ = stream.write_all(response.as_bytes());
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    if matches!(result, Ok((_, true))) {
+        if let Some(command) = &options.reboot_command {
+            if let Err(error) = verify::checked(
+                Command::new(command).args(["--no-block", "reboot"]),
+                "requesting reboot",
+            ) {
+                eprintln!("nix-update-remote: {error}");
+            }
+        }
+    }
 }
 
-fn apply_request(stream: &mut UnixStream, options: &Options) -> Result<PathBuf, String> {
+fn apply_request(stream: &mut UnixStream, options: &Options) -> Result<(PathBuf, bool), String> {
     authenticate_peer(stream, options.update_uid)?;
+    if protocol::read_control_line(stream)? != protocol::MAGIC {
+        return Err("invalid protocol header".into());
+    }
+    let operation = protocol::read_control_line(stream)?;
+    if operation == "ARTIFACT" {
+        return apply_artifact(stream, options);
+    }
+    if operation != "SWITCH" || options.artifact_prepare.is_some() {
+        return Err("operation is disabled for this backend".into());
+    }
     let mut bytes = Vec::new();
     stream
         .take(protocol::MAX_REQUEST)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
     authenticate_peer(stream, options.update_uid)?;
-    let request = String::from_utf8(bytes).map_err(|_| "request is not UTF-8")?;
-    let requested = protocol::parse_request(&request)?;
+    let tail = String::from_utf8(bytes).map_err(|_| "request is not UTF-8")?;
+    let requested = protocol::parse_request(&format!("{}\nSWITCH\n{tail}", protocol::MAGIC))?;
     let resolved = verify::system(&requested)?;
     let switch = resolved.join("bin/switch-to-configuration");
     verify::closure(
@@ -167,13 +219,7 @@ fn apply_request(stream: &mut UnixStream, options: &Options) -> Result<PathBuf, 
         &options.static_keys,
         options.key_file.as_deref(),
     )?;
-    run_hooks(
-        &options.before_hooks,
-        options,
-        &resolved,
-        "before",
-        "pending",
-    )?;
+    record_event(options, &resolved, "before", "pending");
     let activation = (|| {
         verify::checked(
             Command::new(&options.nix_env)
@@ -191,36 +237,82 @@ fn apply_request(stream: &mut UnixStream, options: &Options) -> Result<PathBuf, 
     } else {
         "failure"
     };
-    if let Err(error) = run_hooks(&options.after_hooks, options, &resolved, "after", result) {
-        eprintln!("nix-update-remote: after-update hook failed: {error}");
-    }
+    record_event(options, &resolved, "after", result);
     activation?;
-    Ok(resolved)
+    Ok((resolved, false))
 }
 
-fn run_hooks(
-    hooks: &[PathBuf],
-    options: &Options,
-    system: &std::path::Path,
-    phase: &str,
-    result: &str,
-) -> Result<(), String> {
-    for hook in hooks {
-        let mut command = Command::new(hook);
-        command
-            .env_clear()
-            .env("PATH", &options.hook_path)
-            .env("UPDATE_PHASE", phase)
-            .env("UPDATE_RESULT", result)
-            .env("UPDATE_SYSTEM", system)
-            .uid(options.hook_uid.ok_or("hook UID missing")?)
-            .gid(options.hook_gid.ok_or("hook GID missing")?);
-        verify::checked(
-            &mut command,
-            &format!("{phase}-update hook {}", hook.display()),
-        )?;
+fn apply_artifact(stream: &mut UnixStream, options: &Options) -> Result<(PathBuf, bool), String> {
+    let prepare = options
+        .artifact_prepare
+        .as_ref()
+        .ok_or("artifact backend is disabled")?;
+    let activate = options
+        .artifact_activate
+        .as_ref()
+        .ok_or("artifact activation is missing")?;
+    let input: OwnedFd = stream.try_clone().map_err(|e| e.to_string())?.into();
+    let mut child = Command::new(prepare)
+        .args(&options.artifact_prepare_args)
+        .env_clear()
+        .stdin(Stdio::from(input))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut receipt = Vec::new();
+    child
+        .stdout
+        .take()
+        .ok_or("backend stdout missing")?
+        .take(protocol::MAX_REQUEST + 1)
+        .read_to_end(&mut receipt)
+        .map_err(|e| e.to_string())?;
+    if receipt.len() > protocol::MAX_REQUEST as usize {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("backend receipt exceeds size limit".into());
     }
-    Ok(())
+    let status = child.wait().map_err(|e| e.to_string())?;
+    authenticate_peer(stream, options.update_uid)?;
+    if !status.success() {
+        record_event(
+            options,
+            std::path::Path::new("unverified-artifact"),
+            "after",
+            "failure",
+        );
+        return Err("artifact verification/staging failed".into());
+    }
+    let (system, reboot) = protocol::parse_artifact_receipt(&receipt)?;
+    if reboot && options.reboot_command.is_none() {
+        return Err("reboot requested but no reboot command configured".into());
+    }
+    record_event(options, &system, "before", "pending");
+    let activation = verify::checked(
+        Command::new(activate)
+            .args(&options.artifact_activate_args)
+            .env_clear()
+            .arg(&system),
+        "activating artifact",
+    );
+    let result = if activation.is_ok() {
+        "success"
+    } else {
+        "failure"
+    };
+    record_event(options, &system, "after", result);
+    activation?;
+    Ok((system, reboot))
+}
+
+fn record_event(options: &Options, system: &std::path::Path, phase: &str, result: &str) {
+    if options.before_hooks.is_empty() && options.after_hooks.is_empty() {
+        return;
+    }
+    if let Err(error) = crate::report_queue::record(&options.report_queue, system, phase, result) {
+        eprintln!("nix-update-remote: cannot persist {phase} update notification: {error}");
+    }
 }
 
 fn authenticate_peer(stream: &UnixStream, expected_uid: u32) -> Result<(), String> {

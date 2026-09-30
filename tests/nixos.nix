@@ -33,6 +33,7 @@ in
           "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
         ];
         trustedPublicKeysFile = "/run/nix-update-remote/trusted-public-keys";
+        reportQueue = "/run/system-update-reports";
         beforeHooks = [ "${testHook}/bin/update-hook-fixture" ];
         afterHooks = [ "${testHook}/bin/update-hook-fixture" ];
       };
@@ -134,6 +135,7 @@ in
       f"grep -Fx 'OK {first}'"
     )
     machine.succeed("grep -Fx first /etc/remote-update-generation")
+    machine.succeed("systemctl start system-update-report-delivery.service")
     events = machine.succeed("cat /tmp/update-hook-events").splitlines()
     assert events == [f"before pending {first}", f"after success {first}"]
     machine.succeed("test $(stat -c %U /tmp/update-hook-events) = update-notifier")
@@ -188,6 +190,7 @@ in
       f"grep -Fx 'OK {second}'"
     )
     machine.succeed("grep -Fx second /etc/remote-update-generation")
+    machine.succeed("systemctl start system-update-report-delivery.service")
     events = machine.succeed("cat /tmp/update-hook-events").splitlines()
     assert events == [f"before pending {first}", f"after success {first}", f"before pending {second}", f"after success {second}"]
 

@@ -1,9 +1,13 @@
 #![forbid(unsafe_code)]
 
+mod artifact;
+mod artifact_client;
 mod authorized_keys;
 mod client;
 mod daemon;
+mod generation_client;
 mod protocol;
+mod report_queue;
 mod ssh_login;
 mod verify;
 
@@ -13,6 +17,14 @@ use std::process::ExitCode;
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("deliver-reports") => report_queue::deliver(&args[1..]),
+        Some("run-hook") => report_queue::run_hook(&args[1..]),
+        Some("deploy-generation") => generation_client::deploy(&args[1..]),
+        Some("deploy-artifact") => artifact_client::deploy(&args[1..]),
+        Some("install-erofs") => artifact::install(&args[1..]),
+        Some("extract-bootstrap") => artifact::extract_bootstrap(&args[1..]),
+        Some("prepare-erofs") => artifact::prepare(&args[1..]),
+        Some("activate-erofs") => artifact::activate(&args[1..]),
         Some("deploy") => client::deploy(&args[1..]),
         Some("daemon") => daemon::run(&args[1..]),
         Some("authorized-keys") => authorized_keys::run(&args[1..]),

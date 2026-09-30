@@ -72,3 +72,48 @@ mod tests {
         assert!(parse_request(&format!("{MAGIC}\nSWITCH\n/nix/store/a;id\n")).is_err());
     }
 }
+
+/// Consume a single bounded line without buffering bytes from the artifact stream.
+pub fn read_control_line(stream: &mut impl std::io::Read) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    loop {
+        let mut byte = [0];
+        stream
+            .read_exact(&mut byte)
+            .map_err(|_| "truncated control header")?;
+        if byte[0] == b'\n' {
+            break;
+        }
+        if bytes.len() >= MAX_REQUEST as usize {
+            return Err("control header too long".into());
+        }
+        bytes.push(byte[0]);
+    }
+    String::from_utf8(bytes).map_err(|_| "control header is not UTF-8".into())
+}
+
+pub fn parse_artifact_receipt(bytes: &[u8]) -> Result<(PathBuf, bool), String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "backend receipt is not UTF-8")?;
+    let mut lines = text.lines();
+    if lines.next() != Some("NIX_UPDATE_ARTIFACT_READY_1") {
+        return Err("invalid backend receipt".into());
+    }
+    let system = lines.next().ok_or("backend receipt lacks candidate")?;
+    if system.is_empty()
+        || system.len() > 1024
+        || !system
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._:-".contains(&b))
+    {
+        return Err("invalid backend candidate".into());
+    }
+    let reboot = match lines.next() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => return Err("invalid backend reboot flag".into()),
+    };
+    if lines.next().is_some() {
+        return Err("trailing backend receipt data".into());
+    }
+    Ok((PathBuf::from(system), reboot))
+}
