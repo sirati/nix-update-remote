@@ -73,6 +73,24 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
             .arg(&system),
         "copying closure",
     )?;
+    // Copy skips paths that are already valid on the destination. Those paths
+    // still need the operator's signatures, including after a fresh install.
+    run(
+        Command::new("nix")
+            .args([
+                "--extra-experimental-features",
+                "nix-command",
+                "store",
+                "copy-sigs",
+                "--substituter",
+                "auto",
+                "--store",
+            ])
+            .arg(store_uri(&options.target)?)
+            .arg("--recursive")
+            .arg(&system),
+        "copying closure signatures",
+    )?;
     apply(&options.target, &system, &options.ssh_args)?;
     if let Some(command) = &options.post_command {
         run(

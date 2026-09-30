@@ -202,7 +202,9 @@ in
     client.succeed("umask 077; ${updater}/bin/nix-update-remote keygen client-update > /root/client-update-key 3> /root/client-update.pub")
     client_public = client.succeed("cat /root/client-update.pub").strip()
     import shlex
-    machine.succeed("echo " + shlex.quote(client_public + "\n" + trusted_copy_key) + " > /run/nix-update-remote/trusted-public-keys; chown root:update /run/nix-update-remote/trusted-public-keys; chmod 0440 /run/nix-update-remote/trusted-public-keys")
+    # Every closure path already exists remotely. Trust only the new client
+    # key: copying content alone cannot satisfy recursive verification.
+    machine.succeed("echo " + shlex.quote(client_public) + " > /run/nix-update-remote/trusted-public-keys; chown root:update /run/nix-update-remote/trusted-public-keys; chmod 0440 /run/nix-update-remote/trusted-public-keys")
     client.succeed("mkdir -p /root/.ssh; echo 'Host machine\n IdentityFile /root/.ssh/update-b\n IdentitiesOnly yes\n StrictHostKeyChecking no\n UserKnownHostsFile /dev/null\n BatchMode yes' > /root/.ssh/config")
     output = client.succeed(f"cd /root && NIX_SSHOPTS='{nix_ssh_b}' ${updater}/bin/nix-update-remote deploy --ssh-arg -o --ssh-arg BatchMode=yes --target update@machine --installable {second} --key-command ${pkgs.coreutils}/bin/cat --key-arg /root/client-update-key --post-command ${pkgs.findutils}/bin/find --post-arg /root --post-arg -maxdepth --post-arg 1 --post-arg -name --post-arg 'system-update-roots-*' --post-arg -exec --post-arg ${pkgs.coreutils}/bin/test --post-arg -L --post-arg '{{}}/system' --post-arg ';' --post-arg -print")
     assert "/root/system-update-roots-" in output, output
