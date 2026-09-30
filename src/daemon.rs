@@ -23,6 +23,8 @@ struct Options {
     artifact_prepare_args: Vec<String>,
     artifact_activate_args: Vec<String>,
     reboot_command: Option<PathBuf>,
+    restart_command: Option<PathBuf>,
+    restart_args: Vec<String>,
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -59,6 +61,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut artifact_prepare = None;
     let mut artifact_activate = None;
     let mut reboot_command = None;
+    let mut restart_command = None;
+    let mut restart_args = Vec::new();
     let mut artifact_prepare_args = Vec::new();
     let mut artifact_activate_args = Vec::new();
     let mut iter = args.iter();
@@ -102,6 +106,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
                 let _ = next_value(&mut iter, arg)?;
             }
             "--report-queue" => report_queue = next_path(&mut iter, arg)?,
+            "--restart-command" => restart_command = Some(next_path(&mut iter, arg)?),
+            "--restart-arg" => restart_args.push(next_value(&mut iter, arg)?),
             _ => return Err(format!("unknown daemon argument: {arg}")),
         }
     }
@@ -112,6 +118,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         .iter()
         .chain(artifact_activate.iter())
         .chain(reboot_command.iter())
+        .chain(restart_command.iter())
     {
         if !command.starts_with("/nix/store/") || !command.is_absolute() {
             return Err("backend commands must be immutable Nix store executables".into());
@@ -149,6 +156,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         artifact_prepare_args,
         artifact_activate_args,
         reboot_command,
+        restart_command,
+        restart_args,
     })
 }
 
@@ -184,6 +193,17 @@ fn handle(mut stream: UnixStream, options: &Options) {
             if let Err(error) = verify::checked(
                 Command::new(command).args(["--no-block", "reboot"]),
                 "requesting reboot",
+            ) {
+                eprintln!("nix-update-remote: {error}");
+            }
+        }
+    } else if result.is_ok() {
+        // Activation and durable reporting have completed, and the response
+        // is already on the socket. Refresh the broker's own configuration.
+        if let Some(command) = &options.restart_command {
+            if let Err(error) = verify::checked(
+                Command::new(command).args(&options.restart_args),
+                "requesting broker restart",
             ) {
                 eprintln!("nix-update-remote: {error}");
             }

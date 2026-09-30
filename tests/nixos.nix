@@ -45,7 +45,10 @@ in
       environment.systemPackages = [ pkgs.python3 ];
       specialisation = {
         first.configuration.environment.etc."remote-update-generation".text = "first";
-        second.configuration.environment.etc."remote-update-generation".text = "second";
+        second.configuration = {
+          environment.etc."remote-update-generation".text = "second";
+          systemd.services.nix-update-remote.environment.UPDATE_TEST_GENERATION = "second";
+        };
         old-key.configuration.environment.etc."remote-update-generation".text = "old-key";
       };
       system.stateVersion = "26.05";
@@ -191,6 +194,9 @@ in
       f"grep -Fx 'OK {second}'"
     )
     machine.succeed("grep -Fx second /etc/remote-update-generation")
+    # The unit changed during activation. Its new environment must only be
+    # loaded after the successful response, without killing activation.
+    machine.wait_until_succeeds("grep -zFx UPDATE_TEST_GENERATION=second /proc/$(systemctl show nix-update-remote.service -p MainPID --value)/environ")
     machine.succeed("systemctl start system-update-report-delivery.service")
     events = machine.succeed("cat /tmp/update-hook-events").splitlines()
     assert events == [f"before pending {first}", f"after success {first}", f"before pending {second}", f"after success {second}"]
