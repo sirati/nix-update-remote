@@ -153,3 +153,18 @@ executes that configured command. For example, the server integration requests
 its secrets deployment through nix-secrets at this point. The independent
 updater has no dependency on that provider. Without reboot, this post-operation
 is deferred so new-schema secrets cannot be deployed into the old system.
+
+### Configured operator client
+
+`configured-deploy --installable FLAKE#CONFIG --plan FILE` evaluates a public
+Nix metadata function against that configuration and runs the existing update
+backend. The function supplies argument arrays for an external signing session,
+SSH authentication, key provider, and postdeployment operation. The updater
+remains independent of those providers.
+
+`--installable`, `--target-host update@HOST`, and `--ssh-port PORT` can select a
+runtime deployment configuration without rebuilding the application. The SSH
+public key comes from that configuration; target overrides retain its identity
+and strict host verification. `--no-reboot` suppresses a configured reboot.
+Only the public SSH key is written temporarily beneath the checkout, and it is
+removed on exit. Backend GC roots remain alive through the postdeployment step.

@@ -12,3 +12,5 @@ strip = true
 
 [dependencies]
 rustix = { version = "1.1.5", features = ["net", "process", "fs", "thread"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
