@@ -10,6 +10,8 @@ let
   bundledUpdater = import ../package.nix { inherit pkgs; };
   updaterExe = lib.getExe cfg.package;
   staticKeysEnv = lib.concatStringsSep "," cfg.trustedPublicKeys;
+  artifactArgs = [ cfg.artifact.stateRoot cfg.artifact.publicKeyFile cfg.artifact.verifier "${pkgs.coreutils}/bin/sha512sum" ]
+    ++ lib.optionals cfg.artifact.bootstrap.enable [ "${pkgs.util-linux}/bin/unshare" "${pkgs.util-linux}/bin/mount" "${pkgs.util-linux}/bin/umount" ];
   runtimeKeysEnv = lib.optionalString (cfg.trustedPublicKeysFile != null) (
     "NIX_UPDATE_REMOTE_RUNTIME_KEYS=${cfg.trustedPublicKeysFile}"
   );
@@ -50,6 +52,22 @@ in
         generation signed with an existing trusted key.
       '';
     };
+    artifact = {
+      enable = lib.mkEnableOption "the signed EROFS artifact backend instead of signed Nix closures";
+      stateRoot = lib.mkOption { type = lib.types.str; default = "/persistent/nmbl-generations"; };
+      publicKeyFile = lib.mkOption { type = lib.types.str; default = "/etc/nmbl/trusted-update.pub"; };
+      bootstrap.enable = lib.mkEnableOption "required authenticated bootstrap kernel/initrd metadata in each signed image";
+      verifier = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Immutable nmbl-sign executable supplied by the artifact integration.";
+      };
+    };
+    reportQueue = lib.mkOption {
+      type = lib.types.str;
+      default = "/persistent/system-update-reports";
+      description = "Durable root-owned events awaiting asynchronous notification; reporting never blocks recovery updates.";
+    };
     hookUser = lib.mkOption { type = lib.types.str; default = "update-notifier"; };
     hookUid = lib.mkOption { type = lib.types.int; default = 2993; };
     hookGid = lib.mkOption { type = lib.types.int; default = cfg.hookUid; };
@@ -57,17 +75,22 @@ in
     beforeHooks = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
-      description = "Immutable executables run as hookUser after verification and before the profile switch; failure aborts the update.";
+      description = "Notification executables for durable before events, delivered asynchronously as hookUser; outages never abort updates.";
     };
     afterHooks = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
-      description = "Immutable executables run as hookUser after activation succeeds or fails; failure is logged without changing the activation result.";
+      description = "Notification executables for durable activation outcomes, retried asynchronously as hookUser.";
     };
   };
 
   config = lib.mkIf cfg.enable {
     assertions = [
+      {
+        assertion = !cfg.artifact.enable || (lib.hasPrefix "/" cfg.artifact.stateRoot && !(lib.hasPrefix "/nix/store" cfg.artifact.stateRoot)
+          && lib.hasPrefix "/" cfg.artifact.publicKeyFile && lib.hasPrefix "/nix/store/" cfg.artifact.verifier);
+        message = "Artifact updates need a mutable absolute state root, absolute public key, and immutable verifier.";
+      }
       {
         assertion =
           lib.hasPrefix "/" cfg.authorizedKeysFile
@@ -76,7 +99,7 @@ in
         message = "remoteUpdate.authorizedKeysFile must be an absolute mutable file named after the user.";
       }
       {
-        assertion = cfg.trustedPublicKeys != [ ] || cfg.trustedPublicKeysFile != null;
+        assertion = cfg.artifact.enable || cfg.trustedPublicKeys != [ ] || cfg.trustedPublicKeysFile != null;
         message = "remoteUpdate requires a static or runtime deployment signing public key.";
       }
       {
@@ -131,7 +154,7 @@ in
         AuthenticationMethods publickey
         PasswordAuthentication no
         KbdInteractiveAuthentication no
-        SetEnv NIX_UPDATE_REMOTE_STATIC_KEYS=${staticKeysEnv} ${runtimeKeysEnv}
+        SetEnv NIX_UPDATE_REMOTE_MODE=${if cfg.artifact.enable then "artifact" else "closure"} NIX_UPDATE_REMOTE_STATIC_KEYS=${staticKeysEnv} ${runtimeKeysEnv}
         DisableForwarding yes
         PermitTTY no
         PermitUserRC no
@@ -160,7 +183,13 @@ in
             "${pkgs.nix}/bin/nix-env"
             "--update-uid"
             (toString cfg.uid)
+            "--report-queue" cfg.reportQueue
           ]
+          ++ lib.optionals cfg.artifact.enable (
+            [ "--artifact-prepare" updaterExe "--artifact-activate" updaterExe "--reboot-command" "${pkgs.systemd}/bin/systemctl" ]
+            ++ lib.concatMap (arg: [ "--artifact-prepare-arg" arg ]) ([ "prepare-erofs" ] ++ artifactArgs)
+            ++ lib.concatMap (arg: [ "--artifact-activate-arg" arg ]) ([ "activate-erofs" ] ++ artifactArgs)
+          )
           ++ lib.concatMap (key: [ "--trusted-key" key ]) cfg.trustedPublicKeys
           ++ lib.optionals (cfg.trustedPublicKeysFile != null) [
             "--trusted-key-file"
@@ -177,9 +206,36 @@ in
       };
     };
 
+    systemd.services.system-update-report-delivery = lib.mkIf (cfg.beforeHooks != [ ] || cfg.afterHooks != [ ]) {
+      description = "Deliver queued system update notifications";
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        User = "root";
+        UMask = "0077";
+        ExecStart = lib.escapeShellArgs (
+          [ updaterExe "deliver-reports" "--queue" cfg.reportQueue
+            "--hook-uid" (toString cfg.hookUid) "--hook-gid" (toString cfg.hookGid)
+            "--hook-path" cfg.hookPath ]
+          ++ lib.concatMap (hook: [ "--before-hook" hook ]) cfg.beforeHooks
+          ++ lib.concatMap (hook: [ "--after-hook" hook ]) cfg.afterHooks
+        );
+        # Pending delivery is expected while keys, DNS or mail are unavailable.
+        SuccessExitStatus = [ 1 ];
+        TimeoutStartSec = "2min";
+      };
+    };
+    systemd.timers.system-update-report-delivery = lib.mkIf (cfg.beforeHooks != [ ] || cfg.afterHooks != [ ]) {
+      wantedBy = [ "timers.target" ];
+      timerConfig = { OnBootSec = "10s"; OnUnitInactiveSec = "30s"; };
+    };
     systemd.tmpfiles.rules = [
       "d ${builtins.dirOf cfg.authorizedKeysFile} 0700 root root - -"
+      "d ${cfg.reportQueue} 0700 root root - -"
       "d /run/nix-update-remote 2750 root ${cfg.user} - -"
+    ] ++ lib.optionals cfg.artifact.enable [
+      "d ${cfg.artifact.stateRoot} 0700 root root - -"
     ] ++ lib.optional (cfg.trustedPublicKeysFile != null)
       "d ${builtins.dirOf cfg.trustedPublicKeysFile} 0750 root ${cfg.user} - -";
 
