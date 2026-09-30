@@ -220,6 +220,7 @@ fn build(options: &Options, root: &Path) -> Result<PathBuf, String> {
     }
     let output = command
         .arg(&options.installable)
+        .stderr(Stdio::inherit())
         .output()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
