@@ -46,7 +46,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     let get = |key: &str| values.get(key).map(String::as_str).ok_or_else(|| format!("missing {key}"));
     let installable = get("--installable")?;
     let nix = values.get("--nix").map(String::as_str).unwrap_or("nix");
-    let result = Command::new(nix).args(["eval", "--json", &format!("{installable}.config"), "--apply", &format!("c: (import {}) c", get("--plan")?)]).output().map_err(|e| e.to_string())?;
+    let result = Command::new(nix).args(["eval", "--impure", "--json", &format!("{installable}.config"), "--apply", &format!("c: (import {}) c", get("--plan")?)]).output().map_err(|e| e.to_string())?;
     if !result.status.success() {
         use std::io::Write;
         let _ = std::io::stderr().write_all(&result.stderr);
