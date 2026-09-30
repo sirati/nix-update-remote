@@ -54,13 +54,13 @@ in
     };
     artifact = {
       enable = lib.mkEnableOption "the signed EROFS artifact backend instead of signed Nix closures";
-      stateRoot = lib.mkOption { type = lib.types.str; default = "/persistent/nmbl-generations"; };
-      publicKeyFile = lib.mkOption { type = lib.types.str; default = "/etc/nmbl/trusted-update.pub"; };
+      stateRoot = lib.mkOption { type = lib.types.str; default = "/persistent/system-generations"; };
+      publicKeyFile = lib.mkOption { type = lib.types.str; default = "/etc/system-update/trusted.pub"; };
       bootstrap.enable = lib.mkEnableOption "required authenticated bootstrap kernel/initrd metadata in each signed image";
       verifier = lib.mkOption {
         type = lib.types.str;
         default = "";
-        description = "Immutable nmbl-sign executable supplied by the artifact integration.";
+        description = "Immutable signature verifier executable supplied by the artifact integration.";
       };
     };
     reportQueue = lib.mkOption {
