@@ -10,6 +10,10 @@ let
     mkdir -p $out/bin
     rustc --edition 2024 ${./activation.rs} -o $out/bin/update-activation-fixture
   '';
+  blockedHook = pkgs.runCommand "blocked-update-hook-fixture" { nativeBuildInputs = [ pkgs.rustc pkgs.stdenv.cc ]; } ''
+    mkdir -p $out/bin
+    rustc --edition 2024 --cfg blocked_report ${./hook.rs} -o $out/bin/update-hook-fixture
+  '';
   wrongPeer = pkgs.writeText "remote-update-wrong-peer.py" ''
     import socket
     import sys
@@ -55,6 +59,7 @@ in
         };
         gated.configuration = {
           environment.etc."remote-update-generation".text = "gated";
+          services.nixUpdateRemote.beforeHooks = pkgs.lib.mkForce [ "${blockedHook}/bin/update-hook-fixture" ];
           systemd.services.activation-gate = {
             wantedBy = [ "multi-user.target" ];
             serviceConfig = {
@@ -165,6 +170,7 @@ in
     )
     machine.succeed("grep -Fx first /etc/remote-update-generation")
     machine.succeed("systemctl start system-update-report-delivery.service")
+    machine.wait_until_succeeds("test $(systemctl show system-update-report-delivery.service -p ActiveState --value) = inactive")
     events = machine.succeed("cat /tmp/update-hook-events").splitlines()
     assert events == [f"before pending {first}", f"after success {first}"]
     machine.succeed("test $(stat -c %U /tmp/update-hook-events) = update-notifier")
@@ -223,6 +229,7 @@ in
     # loaded after the successful response, without killing activation.
     machine.wait_until_succeeds("grep -zFx UPDATE_TEST_GENERATION=second /proc/$(systemctl show nix-update-remote.service -p MainPID --value)/environ")
     machine.succeed("systemctl start system-update-report-delivery.service")
+    machine.wait_until_succeeds("test $(systemctl show system-update-report-delivery.service -p ActiveState --value) = inactive")
     events = machine.succeed("cat /tmp/update-hook-events").splitlines()
     assert events == [f"before pending {first}", f"after success {first}", f"before pending {second}", f"after success {second}"]
 
@@ -243,12 +250,14 @@ in
 
     # A service waits for a deployment prerequisite. The real client must
     # invoke its external activation callback before the switch can finish.
+    machine.succeed("touch /tmp/update-hook-block")
     machine.succeed(f"nix --extra-experimental-features nix-command store sign -r --key-file /run/update-signing-b {gated}")
     client.succeed(f"NIX_SSHOPTS='{nix_ssh_b}' nix --extra-experimental-features nix-command --option trusted-public-keys {shlex.quote(trusted_copy_key)} copy --from ssh-ng://update@machine {gated}")
     gated_command = f"cd /root && NIX_SSHOPTS='{nix_ssh_b}' ${updater}/bin/nix-update-remote deploy --ssh-arg -o --ssh-arg BatchMode=yes --target update@machine --installable {gated} --key-command ${pkgs.coreutils}/bin/cat --key-arg /root/client-update-key --activation-command ${activationFixture}/bin/update-activation-fixture --activation-arg client"
     client.succeed(f"(task_status=0; {gated_command} || task_status=$?; echo $task_status > /root/gated-update.status) > /root/gated-update.log 2>&1 </dev/null &")
     client.wait_until_succeeds("test -f /root/activation-callback-started", timeout=90)
     machine.succeed("grep -Fx gated /etc/remote-update-generation")
+    machine.wait_until_succeeds("test -f /tmp/update-hook-blocked")
     assert machine.succeed("systemctl show activation-gate.service -p ActiveState --value").strip() == "activating"
     client.fail("test -f /root/gated-update.status")
     client.succeed("touch /root/activation-callback-finish")
@@ -257,6 +266,10 @@ in
     client.wait_until_succeeds("test -f /root/gated-update.status", timeout=90)
     client.succeed("grep -Fx 0 /root/gated-update.status")
     machine.wait_for_unit("activation-gate.service")
+    # Reporting is still blocked; the production update already succeeded.
+    machine.succeed("test -f /tmp/update-hook-block; systemctl is-active system-update-report-delivery.service")
+    machine.succeed("rm /tmp/update-hook-block")
+    machine.wait_until_succeeds("test $(systemctl show system-update-report-delivery.service -p ActiveState --value) = inactive")
     client.succeed("test -z \"$(find /root -maxdepth 1 -name 'system-update-roots-*')\"")
 
     # Failure after /etc has changed must also refresh the broker. The next

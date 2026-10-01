@@ -219,7 +219,8 @@ in
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       serviceConfig = {
-        Type = "oneshot";
+        # Activation waits only for exec, not for the remote mail transport.
+        Type = "exec";
         User = "root";
         UMask = "0077";
         ExecStart = lib.escapeShellArgs (
@@ -231,7 +232,7 @@ in
         );
         # Pending delivery is expected while keys, DNS or mail are unavailable.
         SuccessExitStatus = [ 1 ];
-        TimeoutStartSec = "2min";
+        RuntimeMaxSec = "2min";
       };
     };
     systemd.timers.system-update-report-delivery = lib.mkIf (cfg.beforeHooks != [ ] || cfg.afterHooks != [ ]) {
