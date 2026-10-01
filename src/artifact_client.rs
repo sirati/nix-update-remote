@@ -1,12 +1,74 @@
 //! Operator path for signing and uploading a prepared artifact set.
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Temporary(PathBuf);
+
+fn stage_source(source: &Path, destination: &Path) -> Result<(), String> {
+    let canonical = fs::canonicalize(source).map_err(|e| e.to_string())?;
+    let metadata = fs::metadata(&canonical).map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Err("artifact source must be a regular file".into());
+    }
+    if canonical.starts_with("/nix/store")
+        && fs::metadata("/nix/store").is_ok_and(|store| store.uid() == metadata.uid())
+        && metadata.mode() & 0o222 == 0
+    {
+        // The generation client retains registered roots through signing,
+        // upload and activation. Borrow immutable payloads instead of making
+        // another multi-gigabyte image in the operator checkout.
+        symlink(canonical, destination).map_err(|e| e.to_string())
+    } else {
+        // Mutable inputs need a private snapshot for signing and upload.
+        fs::copy(source, destination).map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+
+    fn directory(name: &str) -> Temporary {
+        let path = std::env::temp_dir().join(format!("artifact-staging-{name}-{}", std::process::id()));
+        fs::create_dir(&path).unwrap();
+        Temporary(path)
+    }
+
+    #[test]
+    fn immutable_store_payload_is_borrowed_without_copying() {
+        let directory = directory("immutable");
+        let source = Path::new(option_env!("NIX_UPDATE_ARTIFACT_TEST_SOURCE")
+            .unwrap_or("/run/current-system/sw/bin/true"));
+        let destination = directory.0.join("payload");
+        stage_source(source, &destination).unwrap();
+        assert!(fs::symlink_metadata(&destination).unwrap().is_symlink());
+        assert_eq!(fs::canonicalize(&destination).unwrap(), fs::canonicalize(source).unwrap());
+        assert_eq!(fs::read(&destination).unwrap(), fs::read(source).unwrap());
+    }
+
+    #[test]
+    fn mutable_payload_and_its_alias_are_snapshotted_before_signing() {
+        let directory = directory("mutable");
+        let source = directory.0.join("source");
+        let alias = directory.0.join("alias");
+        fs::write(&source, b"approved payload").unwrap();
+        symlink(&source, &alias).unwrap();
+        for (name, path) in [("direct", &source), ("indirect", &alias)] {
+            let destination = directory.0.join(name);
+            stage_source(path, &destination).unwrap();
+            assert!(!fs::symlink_metadata(&destination).unwrap().is_symlink());
+        }
+        fs::write(&source, b"changed payload").unwrap();
+        for name in ["direct", "indirect"] {
+            assert_eq!(fs::read(directory.0.join(name)).unwrap(), b"approved payload");
+        }
+        assert!(stage_source(&directory.0, &directory.0.join("invalid")).is_err());
+    }
+}
 impl Drop for Temporary {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
@@ -110,7 +172,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
             return Err(format!("missing {option}"));
         };
         let path = temporary.0.join(name);
-        fs::copy(source, &path).map_err(|e| e.to_string())?;
+        stage_source(source, &path)?;
         let mut sign = Command::new(&signer);
         let mut provider = None;
         if let Some(key) = &key {
