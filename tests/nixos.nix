@@ -64,6 +64,14 @@ in
             };
           };
         };
+        failed.configuration = {
+          environment.etc."remote-update-generation".text = "failed";
+          systemd.services.nix-update-remote.environment.UPDATE_TEST_GENERATION = "failed";
+          systemd.services.activation-failure = {
+            wantedBy = [ "multi-user.target" ];
+            serviceConfig = { Type = "oneshot"; ExecStart = "${pkgs.coreutils}/bin/false"; };
+          };
+        };
         old-key.configuration.environment.etc."remote-update-generation".text = "old-key";
       };
       system.stateVersion = "26.05";
@@ -110,6 +118,7 @@ in
 
     first = machine.succeed("readlink -f /run/current-system/specialisation/first").strip()
     second = machine.succeed("readlink -f /run/current-system/specialisation/second").strip()
+    failed = machine.succeed("readlink -f /run/current-system/specialisation/failed").strip()
     gated = machine.succeed("readlink -f /run/current-system/specialisation/gated").strip()
     old_key = machine.succeed("readlink -f /run/current-system/specialisation/old-key").strip()
 
@@ -249,6 +258,18 @@ in
     client.succeed("grep -Fx 0 /root/gated-update.status")
     machine.wait_for_unit("activation-gate.service")
     client.succeed("test -z \"$(find /root -maxdepth 1 -name 'system-update-roots-*')\"")
+
+    # Failure after /etc has changed must also refresh the broker. The next
+    # restricted update must work without restarting services by hand.
+    machine.succeed(f"nix --extra-experimental-features nix-command store sign -r --key-file /run/update-signing-b {failed}")
+    client.succeed(f"NIX_SSHOPTS='{nix_ssh_b}' nix --extra-experimental-features nix-command --option trusted-public-keys {shlex.quote(trusted_copy_key)} copy --from ssh-ng://update@machine {failed}")
+    retry_command = f"cd /root && NIX_SSHOPTS='{nix_ssh_b}' ${updater}/bin/nix-update-remote deploy --ssh-arg -o --ssh-arg BatchMode=yes --target update@machine --key-command ${pkgs.coreutils}/bin/cat --key-arg /root/client-update-key --installable"
+    client.fail(f"{retry_command} {failed}")
+    machine.succeed("grep -Fx failed /etc/remote-update-generation")
+    machine.wait_until_succeeds("grep -zq UPDATE_TEST_GENERATION=failed /proc/$(systemctl show nix-update-remote.service -p MainPID --value)/environ")
+    client.succeed(f"{retry_command} {second}")
+    machine.succeed("grep -Fx second /etc/remote-update-generation")
+    machine.wait_until_succeeds("grep -zq UPDATE_TEST_GENERATION=second /proc/$(systemctl show nix-update-remote.service -p MainPID --value)/environ")
 
     machine.succeed(
       "shred -u /run/update-signing-a /run/update-signing-b",
