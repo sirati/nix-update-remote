@@ -1,4 +1,5 @@
 //! Build, retain, sign and upload a generation in one operator transaction.
+use crate::cancellation::ManagedCommand;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -33,7 +34,7 @@ fn build(
     }
     let output = command
         .arg(format!("{installable}.config.{attribute}"))
-        .output()
+        .managed_output()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
@@ -194,7 +195,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
             }
             let output = command
                 .arg(format!("{installable}.config.{enabled_attribute}"))
-                .output()
+                .managed_output()
                 .map_err(|e| e.to_string())?;
             if !output.status.success() {
                 return Err("evaluating optional artifact failed".into());

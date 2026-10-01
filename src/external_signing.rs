@@ -1,4 +1,5 @@
 //! Bounded, dependency-independent artifact signing command protocol.
+use crate::cancellation::ManagedCommand;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -95,14 +96,19 @@ fn exchange(command: &str, args: &[String], input: Vec<u8>) -> Result<Vec<u8>, S
     if input.len() > LIMIT {
         return Err("signing manifest exceeds limit".into());
     }
+    // A small explicit pipe bounds transport buffering independently of the
+    // host's pipe defaults; the writer remains concurrent with the response.
+    let (input_read, input_write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
+        .map_err(|e| e.to_string())?;
+    rustix::pipe::fcntl_setpipe_size(&input_write, 4096).map_err(|e| e.to_string())?;
     let mut child = Command::new(command)
         .args(args)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::from(input_read))
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .spawn()
+        .managed_spawn()
         .map_err(|e| e.to_string())?;
-    let mut stdin = child.stdin.take().ok_or("missing signing stdin")?;
+    let mut stdin = fs::File::from(input_write);
     let writer = std::thread::spawn(move || stdin.write_all(&input));
     let mut stdout = child.stdout.take().ok_or("missing signing stdout")?;
     let mut output = Vec::new();
@@ -114,8 +120,9 @@ fn exchange(command: &str, args: &[String], input: Vec<u8>) -> Result<Vec<u8>, S
         let _ = child.kill();
     }
     drop(stdout);
-    let status = child.wait().map_err(|e| e.to_string())?;
+    let status = child.wait().map_err(|e| e.to_string());
     let written = writer.join().map_err(|_| "signing input thread failed")?;
+    let status = status?;
     read.map_err(|e| e.to_string())?;
     if output.len() > LIMIT {
         return Err("signing response exceeds limit".into());
@@ -144,7 +151,7 @@ pub fn sign(
         let path = fs::canonicalize(&staged).map_err(|e| e.to_string())?;
         let output = Command::new(hash)
             .arg(&path)
-            .output()
+            .managed_output()
             .map_err(|e| e.to_string())?;
         if !output.status.success() {
             return Err("hashing signing artifact failed".into());

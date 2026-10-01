@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod cancellation;
 mod artifact;
 mod artifact_client;
 mod external_signing;
@@ -19,6 +20,9 @@ use std::process::ExitCode;
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("deploy" | "configured-deploy" | "deploy-artifact" | "deploy-generation")) {
+        cancellation::install().map_err(|e| e.to_string())?;
+    }
     match args.first().map(String::as_str) {
         Some("deliver-reports") => report_queue::deliver(&args[1..]),
         Some("run-hook") => report_queue::run_hook(&args[1..]),
