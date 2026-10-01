@@ -68,7 +68,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     }).transpose()?;
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut replacements = BTreeMap::from([("{installable}", installable.to_owned()), ("{host}", plan.host.clone()), ("{target}", target.clone())]);
-    if std::env::var_os(&plan.session_environment).is_none() {
+    if !plan.session_command.is_empty() && std::env::var_os(&plan.session_environment).is_none() {
         let session = expanded(&plan.session_command, &replacements);
         let (command, arguments) = session.split_first().ok_or("missing provider session command")?;
         return checked(Command::new(command).args(arguments).arg(&executable).arg("configured-deploy").args(args));

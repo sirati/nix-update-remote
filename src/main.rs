@@ -2,6 +2,7 @@
 
 mod artifact;
 mod artifact_client;
+mod external_signing;
 mod authorized_keys;
 mod client;
 mod configured_client;
