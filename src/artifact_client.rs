@@ -1,4 +1,5 @@
 //! Operator path for signing and uploading a prepared artifact set.
+use crate::cancellation::ManagedCommand;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -189,7 +190,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
                 .args(&key_args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
-                .spawn()
+                .managed_spawn()
                 .map_err(|e| e.to_string())?;
             sign.args(["sign", "--key-stdin"]).stdin(
                 child
@@ -205,7 +206,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
             .arg(path)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
-            .status()
+            .managed_status()
             .map_err(|e| e.to_string());
         let mut provider_ok = true;
         if let Some(mut child) = provider {
@@ -221,7 +222,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     let digest = |name: &str| -> Result<String, String> {
         let output = Command::new(&hash)
             .arg(temporary.0.join(name))
-            .output()
+            .managed_output()
             .map_err(|e| e.to_string())?;
         if !output.status.success() {
             return Err("hashing update failed".into());
@@ -292,7 +293,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .spawn()
+        .managed_spawn()
         .map_err(|e| e.to_string())?;
     let send = (|| {
         let mut input = ssh.stdin.take().ok_or("missing SSH input")?;
@@ -322,7 +323,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
             let output = Command::new(&ssh_command)
                 .args(&ssh_args)
                 .args(["--", &target, "current-system"])
-                .output()
+                .managed_output()
                 .map_err(|e| e.to_string())?;
             if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == expected
             {
@@ -342,7 +343,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
         } else {
             let status = Command::new(command)
                 .args(post_args)
-                .status()
+                .managed_status()
                 .map_err(|e| e.to_string())?;
             if !status.success() {
                 return Err(

@@ -1,9 +1,10 @@
+use crate::cancellation::ManagedCommand;
 use crate::protocol;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 struct Options {
@@ -45,7 +46,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
                 .args(&options.key_args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .spawn()
+                .managed_spawn()
                 .map_err(|e| e.to_string())?;
         let input = provider
             .stdout
@@ -55,7 +56,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
             .arg("/proc/self/fd/0")
             .arg(&system)
             .stdin(Stdio::from(input))
-            .status()
+            .managed_status()
             .map_err(|e| e.to_string());
         let provided = provider.wait().map_err(|e| e.to_string())?;
         if !provided.success() || !signed?.success() {
@@ -237,8 +238,7 @@ fn build(options: &Options, root: &Path) -> Result<PathBuf, String> {
     }
     let output = command
         .arg(&options.installable)
-        .stderr(Stdio::inherit())
-        .output()
+        .managed_output_inherit_stderr()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
         return Err("building system failed".into());
@@ -264,7 +264,7 @@ fn store_uri(target: &str) -> Result<String, String> {
 
 // Killing or interrupting the local client must reap its SSH child. A remote
 // activation already in progress continues under the root broker.
-struct ApplyChild(Child);
+struct ApplyChild(crate::cancellation::ManagedChild);
 impl Drop for ApplyChild {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -280,7 +280,7 @@ fn apply(options: &Options, system: &Path) -> Result<(), String> {
             .args(["--", target, "apply"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .spawn()
+            .managed_spawn()
             .map_err(|error| error.to_string())?,
     );
     child
@@ -339,7 +339,7 @@ fn current_system(target: &str, ssh_args: &[String], system: &Path) -> Result<bo
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .spawn()
+            .managed_spawn()
             .map_err(|e| e.to_string())?,
     );
     let mut response = Vec::new();
@@ -371,7 +371,7 @@ fn activation_callback(options: &Options) -> Result<(), String> {
 fn run(command: &mut Command, action: &str) -> Result<(), String> {
     command.stdin(Stdio::null());
     command
-        .status()
+        .managed_status()
         .map_err(|e| e.to_string())
         .and_then(|status| {
             status

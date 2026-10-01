@@ -11,6 +11,7 @@ panic = "abort"
 strip = true
 
 [dependencies]
-rustix = { version = "1.1.5", features = ["net", "process", "fs", "thread"] }
+rustix = { version = "1.1.5", features = ["net", "process", "fs", "thread", "pipe"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+signal-hook = "0.3.18"

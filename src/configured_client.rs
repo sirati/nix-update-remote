@@ -1,5 +1,6 @@
 //! Public configuration adapter. Providers remain external executables; this
 //! updater does not depend on a particular secret manager or boot format.
+use crate::cancellation::ManagedCommand;
 use serde::Deserialize;
 use std::{collections::BTreeMap, fs, process::Command};
 #[derive(Deserialize)]
@@ -18,7 +19,7 @@ struct Plan {
     reboot: bool,
 }
 fn checked(command: &mut Command) -> Result<(), String> {
-    if command.status().map_err(|e| e.to_string())?.success() { Ok(()) }
+    if command.managed_status().map_err(|e| e.to_string())?.success() { Ok(()) }
     else { Err("configured update failed".into()) }
 }
 fn substitute(value: &str, replacements: &BTreeMap<&str, String>) -> String {
@@ -30,7 +31,7 @@ fn expanded(values: &[String], replacements: &BTreeMap<&str, String>) -> Vec<Str
 // Nix parses NIX_SSHOPTS as shell words, but never executes this string.
 fn quote(value: &str) -> String { format!("'{}'", value.replace('\'', "'\\''")) }
 struct PublicKey(std::path::PathBuf);
-impl Drop for PublicKey { fn drop(&mut self) { let _ = fs::remove_file(&self.0); } }
+impl Drop for PublicKey { fn drop(&mut self) { let _ = fs::remove_file(&self.0); if let Some(parent) = self.0.parent() { let _ = fs::remove_dir(parent); } } }
 pub fn deploy(args: &[String]) -> Result<(), String> {
     let mut values = BTreeMap::new();
     let mut no_reboot = false;
@@ -46,7 +47,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     let get = |key: &str| values.get(key).map(String::as_str).ok_or_else(|| format!("missing {key}"));
     let installable = get("--installable")?;
     let nix = values.get("--nix").map(String::as_str).unwrap_or("nix");
-    let result = Command::new(nix).args(["eval", "--impure", "--json", &format!("{installable}.config"), "--apply", &format!("c: (import {}) c", get("--plan")?)]).output().map_err(|e| e.to_string())?;
+    let result = Command::new(nix).args(["eval", "--impure", "--json", &format!("{installable}.config"), "--apply", &format!("c: (import {}) c", get("--plan")?)]).managed_output().map_err(|e| e.to_string())?;
     if !result.status.success() {
         use std::io::Write;
         let _ = std::io::stderr().write_all(&result.stderr);
@@ -79,9 +80,9 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let path = root.join(format!("{}.pub", std::process::id()));
     let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| e.to_string())?;
+    let key = PublicKey(path);
     use std::io::Write;
     file.write_all(format!("{}\n", plan.public_key).as_bytes()).map_err(|e| e.to_string())?;
-    let key = PublicKey(path);
     replacements.insert("{publicKey}", key.0.to_string_lossy().into_owned());
     let auth = expanded(&plan.authentication_command, &replacements);
     let (command, arguments) = auth.split_first().ok_or("missing update authentication command")?;

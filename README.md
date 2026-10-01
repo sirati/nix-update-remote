@@ -175,3 +175,9 @@ public key comes from that configuration; target overrides retain its identity
 and strict host verification. `--no-reboot` suppresses a configured reboot.
 Only the public SSH key is written temporarily beneath the checkout, and it is
 removed on exit. Backend GC roots remain alive through the postdeployment step.
+
+### Interrupted operator commands
+
+SIGINT and SIGTERM cancel deployment, terminate and reap owned child process groups, and remove the command’s temporary signed artifacts, public SSH key files, and repository GC roots. Signing and upload pipes are closed before cleanup.
+
+SIGKILL and machine failure cannot run cleanup. Their leftovers remain visible in the checkout (`system-update-*`); remove an abandoned transaction only after confirming its operator processes have stopped. Active transactions must retain their roots until completion.
