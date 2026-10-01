@@ -178,6 +178,7 @@ fn next_path<'a>(
 }
 
 fn handle(mut stream: UnixStream, options: &Options) {
+    let previous_system = fs::read_link("/run/current-system").ok();
     let result = apply_request(&mut stream, options);
     let response = match &result {
         Ok((path, _)) => format!("OK {}\n", path.display()),
@@ -197,9 +198,10 @@ fn handle(mut stream: UnixStream, options: &Options) {
                 eprintln!("nix-update-remote: {error}");
             }
         }
-    } else if result.is_ok() {
-        // Activation and durable reporting have completed, and the response
-        // is already on the socket. Refresh the broker's own configuration.
+    } else if result.is_ok() || fs::read_link("/run/current-system").ok() != previous_system {
+        // A failed service start can still install a new login helper and
+        // broker configuration. Refresh after replying in that case too,
+        // so a retry uses matching binaries instead of needing a reboot.
         if let Some(command) = &options.restart_command {
             if let Err(error) = verify::checked(
                 Command::new(command).args(&options.restart_args),
