@@ -6,6 +6,10 @@ let
     mkdir -p $out/bin
     rustc --edition 2024 ${./hook.rs} -o $out/bin/update-hook-fixture
   '';
+  activationFixture = pkgs.runCommand "update-activation-fixture" { nativeBuildInputs = [ pkgs.rustc pkgs.stdenv.cc ]; } ''
+    mkdir -p $out/bin
+    rustc --edition 2024 ${./activation.rs} -o $out/bin/update-activation-fixture
+  '';
   wrongPeer = pkgs.writeText "remote-update-wrong-peer.py" ''
     import socket
     import sys
@@ -48,6 +52,17 @@ in
         second.configuration = {
           environment.etc."remote-update-generation".text = "second";
           systemd.services.nix-update-remote.environment.UPDATE_TEST_GENERATION = "second";
+        };
+        gated.configuration = {
+          environment.etc."remote-update-generation".text = "gated";
+          systemd.services.activation-gate = {
+            wantedBy = [ "multi-user.target" ];
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = true;
+              ExecStart = "${activationFixture}/bin/update-activation-fixture server";
+            };
+          };
         };
         old-key.configuration.environment.etc."remote-update-generation".text = "old-key";
       };
@@ -95,6 +110,7 @@ in
 
     first = machine.succeed("readlink -f /run/current-system/specialisation/first").strip()
     second = machine.succeed("readlink -f /run/current-system/specialisation/second").strip()
+    gated = machine.succeed("readlink -f /run/current-system/specialisation/gated").strip()
     old_key = machine.succeed("readlink -f /run/current-system/specialisation/old-key").strip()
 
     machine.succeed(
@@ -214,6 +230,24 @@ in
     client.succeed("mkdir -p /root/.ssh; echo 'Host machine\n IdentityFile /root/.ssh/update-b\n IdentitiesOnly yes\n StrictHostKeyChecking no\n UserKnownHostsFile /dev/null\n BatchMode yes' > /root/.ssh/config")
     output = client.succeed(f"cd /root && NIX_SSHOPTS='{nix_ssh_b}' ${updater}/bin/nix-update-remote deploy --ssh-arg -o --ssh-arg BatchMode=yes --target update@machine --installable {second} --key-command ${pkgs.coreutils}/bin/cat --key-arg /root/client-update-key --post-command ${pkgs.findutils}/bin/find --post-arg /root --post-arg -maxdepth --post-arg 1 --post-arg -name --post-arg 'system-update-roots-*' --post-arg -exec --post-arg ${pkgs.coreutils}/bin/test --post-arg -L --post-arg '{{}}/system' --post-arg ';' --post-arg -print")
     assert "/root/system-update-roots-" in output, output
+    client.succeed("test -z \"$(find /root -maxdepth 1 -name 'system-update-roots-*')\"")
+
+    # A service waits for a deployment prerequisite. The real client must
+    # invoke its external activation callback before the switch can finish.
+    machine.succeed(f"nix --extra-experimental-features nix-command store sign -r --key-file /run/update-signing-b {gated}")
+    client.succeed(f"NIX_SSHOPTS='{nix_ssh_b}' nix --extra-experimental-features nix-command --option trusted-public-keys {shlex.quote(trusted_copy_key)} copy --from ssh-ng://update@machine {gated}")
+    gated_command = f"cd /root && NIX_SSHOPTS='{nix_ssh_b}' ${updater}/bin/nix-update-remote deploy --ssh-arg -o --ssh-arg BatchMode=yes --target update@machine --installable {gated} --key-command ${pkgs.coreutils}/bin/cat --key-arg /root/client-update-key --activation-command ${activationFixture}/bin/update-activation-fixture --activation-arg client"
+    client.succeed(f"(task_status=0; {gated_command} || task_status=$?; echo $task_status > /root/gated-update.status) > /root/gated-update.log 2>&1 </dev/null &")
+    client.wait_until_succeeds("test -f /root/activation-callback-started", timeout=90)
+    machine.succeed("grep -Fx gated /etc/remote-update-generation")
+    assert machine.succeed("systemctl show activation-gate.service -p ActiveState --value").strip() == "activating"
+    client.fail("test -f /root/gated-update.status")
+    client.succeed("touch /root/activation-callback-finish")
+    client.fail("test -f /root/gated-update.status")
+    machine.succeed("touch /run/activation-gate-ready")
+    client.wait_until_succeeds("test -f /root/gated-update.status", timeout=90)
+    client.succeed("grep -Fx 0 /root/gated-update.status")
+    machine.wait_for_unit("activation-gate.service")
     client.succeed("test -z \"$(find /root -maxdepth 1 -name 'system-update-roots-*')\"")
 
     machine.succeed(

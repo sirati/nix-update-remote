@@ -146,6 +146,13 @@ and repeated `--remote-arg ARG` for the initial rescue command; arguments are
 quoted individually for SSH. No caller-selected shell code is used by the
 installed restricted service.
 
+Closure updates accept `--activation-command PROGRAM` and repeated
+`--activation-arg ARG`. This callback runs once the restricted `current-system`
+query reports the new configuration, while service startup may still be waiting
+for credentials. The client waits for both the callback and the activation
+result, retaining its checkout GC roots throughout. This lets a secrets provider
+request operator approval without blocking behind services that need its values.
+
 An integration may supply `--post-command PROGRAM` with repeated `--post-arg ARG`
 for operator work after an update. With `--reboot`, the generation workflow waits
 until the restricted SSH `current-system` query matches the built toplevel, then

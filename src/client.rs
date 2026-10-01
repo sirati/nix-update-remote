@@ -1,10 +1,10 @@
 use crate::protocol;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 struct Options {
     target: String,
@@ -13,6 +13,8 @@ struct Options {
     key_command: Option<PathBuf>,
     key_args: Vec<String>,
     impure: bool,
+    activation_command: Option<PathBuf>,
+    activation_args: Vec<String>,
     post_command: Option<PathBuf>,
     post_args: Vec<String>,
     ssh_args: Vec<String>,
@@ -91,7 +93,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
             .arg(&system),
         "copying closure signatures",
     )?;
-    apply(&options.target, &system, &options.ssh_args)?;
+    apply(&options, &system)?;
     if let Some(command) = &options.post_command {
         run(
             Command::new(command).args(&options.post_args),
@@ -138,6 +140,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut key_command = None;
     let mut key_args = Vec::new();
     let mut impure = false;
+    let mut activation_command = None;
+    let mut activation_args = Vec::new();
     let mut post_command = None;
     let mut post_args = Vec::new();
     let mut ssh_args = Vec::new();
@@ -153,6 +157,14 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--key-arg" => key_args.push(iter.next().ok_or("missing key argument")?.clone()),
             "--impure" => impure = true,
             "--ssh-arg" => ssh_args.push(iter.next().ok_or("missing SSH argument")?.clone()),
+            "--activation-command" => {
+                activation_command = Some(PathBuf::from(
+                    iter.next().ok_or("missing activation command")?,
+                ));
+            }
+            "--activation-arg" => {
+                activation_args.push(iter.next().ok_or("missing activation argument")?.clone())
+            }
             "--post-command" => {
                 post_command = Some(PathBuf::from(
                     iter.next().ok_or("missing post-update command")?,
@@ -163,6 +175,9 @@ fn parse(args: &[String]) -> Result<Options, String> {
             }
             _ => return Err(format!("unknown deploy argument: {arg}")),
         }
+    }
+    if !activation_args.is_empty() && activation_command.is_none() {
+        return Err("activation arguments require --activation-command".into());
     }
     if !post_args.is_empty() && post_command.is_none() {
         return Err("post-update arguments require --post-command".into());
@@ -180,6 +195,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         key_command,
         key_args,
         impure,
+        activation_command,
+        activation_args,
         post_command,
         post_args,
         ssh_args,
@@ -245,28 +262,109 @@ fn store_uri(target: &str) -> Result<String, String> {
     Ok(format!("ssh-ng://{user}@{host}"))
 }
 
-fn apply(target: &str, system: &Path, ssh_args: &[String]) -> Result<(), String> {
-    let mut child = Command::new("ssh")
-        .args(ssh_args)
-        .args(["--", target, "apply"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
+// Killing or interrupting the local client must reap its SSH child. A remote
+// activation already in progress continues under the root broker.
+struct ApplyChild(Child);
+impl Drop for ApplyChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn apply(options: &Options, system: &Path) -> Result<(), String> {
+    let target = &options.target;
+    let mut child = ApplyChild(
+        Command::new("ssh")
+            .args(&options.ssh_args)
+            .args(["--", target, "apply"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|error| error.to_string())?,
+    );
     child
+        .0
         .stdin
         .take()
         .ok_or("missing SSH stdin")?
         .write_all(protocol::request(system).as_bytes())
         .map_err(|e| e.to_string())?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| error.to_string())?;
     let expected = format!("OK {}\n", system.display());
-    if !output.status.success() || output.stdout != expected.as_bytes() {
+    let mut callback_ran = false;
+    if options.activation_command.is_some() {
+        while child.0.try_wait().map_err(|e| e.to_string())?.is_none() {
+            // This restricted read reports configuration activation, rather
+            // than service readiness. /run/current-system changes after the
+            // activation script installs /etc, before service start jobs end.
+            // A repeated update can already have this same configuration.
+            if current_system(target, &options.ssh_args, system)? {
+                activation_callback(options)?;
+                callback_ran = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    let mut response = Vec::new();
+    child
+        .0
+        .stdout
+        .take()
+        .ok_or("missing SSH stdout")?
+        .take(protocol::MAX_REQUEST + 1)
+        .read_to_end(&mut response)
+        .map_err(|e| e.to_string())?;
+    if response.len() > protocol::MAX_REQUEST as usize {
+        return Err("remote switch response exceeds size limit".into());
+    }
+    let status = child.0.wait().map_err(|error| error.to_string())?;
+    if !status.success() || response != expected.as_bytes() {
         return Err("remote switch failed or returned an invalid response".into());
     }
+    // Fast activation may complete between polls. The successful broker
+    // reply is stronger evidence, so the callback still runs exactly once.
+    if !callback_ran {
+        activation_callback(options)?;
+    }
     println!("switched {} to {}", target, system.display());
+    Ok(())
+}
+
+fn current_system(target: &str, ssh_args: &[String], system: &Path) -> Result<bool, String> {
+    let mut query = ApplyChild(
+        Command::new("ssh")
+            .args(ssh_args)
+            .args(["--", target, "current-system"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| e.to_string())?,
+    );
+    let mut response = Vec::new();
+    query
+        .0
+        .stdout
+        .take()
+        .ok_or("missing query stdout")?
+        .take(protocol::MAX_REQUEST + 1)
+        .read_to_end(&mut response)
+        .map_err(|e| e.to_string())?;
+    if response.len() > protocol::MAX_REQUEST as usize {
+        return Err("current-system response exceeds size limit".into());
+    }
+    let status = query.0.wait().map_err(|e| e.to_string())?;
+    Ok(status.success() && response == format!("{}\n", system.display()).as_bytes())
+}
+
+fn activation_callback(options: &Options) -> Result<(), String> {
+    if let Some(command) = &options.activation_command {
+        run(
+            Command::new(command).args(&options.activation_args),
+            "configuration activation operation",
+        )?;
+    }
     Ok(())
 }
 
