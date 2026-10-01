@@ -81,6 +81,8 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     let mut hash = None;
     let mut key_command = None;
     let mut key_args = Vec::new();
+    let mut sign_command = None;
+    let mut sign_args = Vec::new();
     let mut ssh_command = "ssh".to_owned();
     let mut ssh_args = Vec::new();
     let mut remote_command = None;
@@ -102,6 +104,8 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
                 post_args.push(iter.next().ok_or("missing post-update argument")?.clone())
             }
             "--wait-system" => wait_system = iter.next().cloned(),
+            "--sign-command" => sign_command = iter.next().cloned(),
+            "--sign-arg" => sign_args.push(iter.next().ok_or("missing signing argument")?.clone()),
             "--key-command" => key_command = iter.next().cloned(),
             "--key-arg" => key_args.push(iter.next().ok_or("missing key argument")?.clone()),
             "--ssh-command" => ssh_command = iter.next().ok_or("missing SSH executable")?.clone(),
@@ -130,15 +134,17 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     {
         return Err("invalid SSH target".into());
     }
-    if key.is_some() == key_command.is_some() {
-        return Err("supply exactly one signing key file or structured key command".into());
+    if usize::from(key.is_some()) + usize::from(key_command.is_some()) + usize::from(sign_command.is_some()) != 1 {
+        return Err("supply exactly one signing key file, key command, or signing command".into());
     }
     if let Some(key) = &key {
         if key.starts_with("/nix/store") || !key.is_file() {
             return Err("signing key must be a file outside the Nix store".into());
         }
     }
-    let signer = signer.ok_or("missing signer")?;
+    if sign_command.is_none() && signer.is_none() { return Err("missing signer".into()); }
+    if sign_command.is_some() && signer.is_some() { return Err("signing command cannot be combined with signer".into()); }
+    if sign_command.is_none() && !sign_args.is_empty() { return Err("sign arguments require signing command".into()); }
     let hash = hash.ok_or("missing sha512sum")?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -173,7 +179,8 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
         };
         let path = temporary.0.join(name);
         stage_source(source, &path)?;
-        let mut sign = Command::new(&signer);
+        if sign_command.is_some() { continue; }
+        let mut sign = Command::new(signer.as_ref().ok_or("missing signer")?);
         let mut provider = None;
         if let Some(key) = &key {
             sign.arg("sign").arg("--key").arg(key);
@@ -207,6 +214,9 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
         if !signing?.success() || !provider_ok {
             return Err("signing update artifact failed".into());
         }
+    }
+    if let Some(command) = sign_command {
+        crate::external_signing::sign(&command, &sign_args, &hash, &temporary.0, &definitions)?;
     }
     let digest = |name: &str| -> Result<String, String> {
         let output = Command::new(&hash)

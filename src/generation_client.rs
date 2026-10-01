@@ -75,6 +75,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     let mut network_attribute = None;
     let mut network_enabled_attribute = None;
     let mut reboot = false;
+    let mut external_signing = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -102,7 +103,12 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
                 reboot = true;
                 pass.push(arg.clone());
             }
-            "--target" | "--signing-key" | "--key-command" | "--key-arg" | "--ssh-command"
+            "--sign-command" => {
+                external_signing = true;
+                pass.push(arg.clone());
+                pass.push(iter.next().ok_or("missing signing command")?.clone());
+            }
+            "--sign-arg" | "--target" | "--signing-key" | "--key-command" | "--key-arg" | "--ssh-command"
             | "--ssh-arg" | "--sha512sum" | "--post-command" | "--post-arg"
             | "--remote-command" | "--remote-arg" => {
                 pass.push(arg.clone());
@@ -140,6 +146,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
         ("--rescue", "--rescue-attribute", "rescue"),
         ("--signer", "--signer-attribute", "signer"),
     ] {
+        if option == "--signer" && external_signing { continue; }
         let path = build(
             &nix,
             &installable,
