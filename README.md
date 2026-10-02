@@ -39,7 +39,13 @@ The client keeps registered GC roots in the checkout until activation and any
 configured `--post-command` finish. Pass repeated `--post-arg` values to request
 secret deployment through your secret manager after a successful switch; the
 updater has no dependency on that manager. Instead of `--signing-key`, a
-structured `--key-command` with repeated `--key-arg` values can supply the key
+`--sign-command` with repeated `--sign-arg` values requests detached signatures
+from an external signer, keeping the private key in that signer. The native
+protocol exchanges version-1 JSON containing canonical Nix path metadata and
+returns one named Ed25519 signature per path. This metadata is requester supplied;
+the protocol does not transfer or verify NAR contents. Signatures are imported
+through Nix's metadata-only cache operation. Alternatively, a structured
+`--key-command` with repeated `--key-arg` values can supply the key
 through a pipe. `keygen NAME` generates an operator key with the private half
 on stdout and the public half on descriptor 3; neither half is written to disk.
 
@@ -95,8 +101,9 @@ boundary.
 
 ## Durable notifications
 
-Before and after events are written and synced to the root-owned `reportQueue`
-(default `/persistent/system-update-reports`) before activation and reboot.
+Events are written and synced to the root-owned `reportQueue`
+(default `/persistent/system-update-reports`): before events precede activation,
+and outcome events follow activation and precede any requested reboot.
 `beforeHooks` and `afterHooks` now deliver these events asynchronously through
 `system-update-report-delivery.service` and its retry timer. Notification keys,
 DNS or SMTP may be unavailable during bootstrap or recovery: verified updates
