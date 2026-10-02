@@ -1,8 +1,22 @@
 //! Generic signature-only signing of standard Nix closure metadata.
 use crate::{cancellation::ManagedCommand, external_signing};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Read,
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    process::{Command, Stdio},
+};
+// The approval protocol is compact; Nix metadata also contains unrelated
+// signatures, derivation and registration fields. Bound each query separately.
 const LIMIT: usize = 4 * 1024 * 1024;
+const QUERY_LIMIT: usize = 16 * 1024 * 1024;
+const MAX_PATHS: usize = 4096;
+const BATCH_SIZE: usize = 64;
+// NAME_MAX includes the store hash and name; one newline per canonical path.
+const DISCOVERY_LIMIT: usize = MAX_PATHS * ("/nix/store/".len() + 255 + 1);
 const ALPHABET: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
 #[derive(Debug, Serialize)]
 struct Request {
@@ -41,7 +55,8 @@ fn store_path(path: &str) -> Result<(), String> {
         .strip_prefix("/nix/store/")
         .ok_or("noncanonical store path")?;
     let (hash, name) = base.split_once('-').ok_or("invalid store basename")?;
-    if hash.len() != 32
+    if base.len() > 255
+        || hash.len() != 32
         || !hash.bytes().all(|b| ALPHABET.contains(&b))
         || name.is_empty()
         || !name
@@ -84,12 +99,12 @@ fn canonical_hash(hash: &str) -> Result<String, String> {
     Ok(format!("sha256:{}", nix32(&bytes)))
 }
 fn manifest(bytes: &[u8]) -> Result<Request, String> {
-    if bytes.len() > LIMIT {
+    if bytes.len() > QUERY_LIMIT {
         return Err("closure metadata exceeds limit".into());
     }
     let input: BTreeMap<String, RawInfo> =
         serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    if input.is_empty() || input.len() > 4096 {
+    if input.is_empty() || input.len() > MAX_PATHS {
         return Err("invalid closure path count".into());
     }
     let mut paths = Vec::new();
@@ -155,25 +170,114 @@ fn narinfo(info: &PathInfo, signature: &str) -> String {
         info.path, info.nar_hash, info.nar_size, refs, signature
     )
 }
-pub fn sign(system: &Path, roots: &Path, command: &Path, args: &[String]) -> Result<(), String> {
-    let output = Command::new("nix")
-        .args([
-            "--extra-experimental-features",
-            "nix-command",
-            "path-info",
-            "--recursive",
-            "--json",
-        ])
-        .arg(system)
-        .managed_output_inherit_stderr()
+fn bounded_query(command: &mut Command, limit: usize) -> Result<Vec<u8>, String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .managed_spawn()
         .map_err(|e| e.to_string())?;
-    if !output.status.success() {
+    let mut bytes = Vec::new();
+    // Drop the pipe before unwinding the managed process group on overflow.
+    child
+        .stdout
+        .take()
+        .ok_or("missing Nix metadata pipe")?
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > limit {
+        return Err("Nix metadata query exceeds bounded output limit".into());
+    }
+    if !child.wait().map_err(|e| e.to_string())?.success() {
         return Err("querying public closure metadata failed".into());
     }
-    let request = manifest(&output.stdout)?;
-    if !request.paths.iter().any(|p| Path::new(&p.path) == system) {
+    Ok(bytes)
+}
+fn query_command(nix: &str, prefix: &[String]) -> Command {
+    let mut command = Command::new(nix);
+    command
+        .args(["--extra-experimental-features", "nix-command"])
+        .args(prefix);
+    command
+}
+fn closure_paths(nix: &str, prefix: &[String], system: &Path) -> Result<Vec<String>, String> {
+    let bytes = bounded_query(
+        query_command(nix, prefix)
+            .args(["path-info", "--recursive"])
+            .arg(system),
+        DISCOVERY_LIMIT,
+    )?;
+    parse_paths(&bytes, system)
+}
+fn parse_paths(bytes: &[u8], system: &Path) -> Result<Vec<String>, String> {
+    let text = std::str::from_utf8(&bytes).map_err(|_| "non-UTF8 closure paths")?;
+    let mut paths: Vec<String> = text.lines().map(str::to_owned).collect();
+    if paths.is_empty() || paths.len() > MAX_PATHS {
+        return Err("invalid closure path count".into());
+    }
+    for path in &paths {
+        store_path(path)?;
+    }
+    paths.sort();
+    if paths.windows(2).any(|w| w[0] == w[1]) {
+        return Err("duplicate closure path".into());
+    }
+    if !paths.iter().any(|p| Path::new(p) == system) {
         return Err("closure metadata omits system".into());
     }
+    Ok(paths)
+}
+fn metadata_batch(nix: &str, prefix: &[String], paths: &[String]) -> Result<Vec<u8>, String> {
+    bounded_query(
+        query_command(nix, prefix)
+            .args(["path-info", "--json", "--json-format", "1"])
+            .args(paths),
+        QUERY_LIMIT,
+    )
+}
+fn query_manifest(
+    nix: &str,
+    prefix: &[String],
+    paths: &[String],
+    batch_size: usize,
+) -> Result<Request, String> {
+    if batch_size == 0 || batch_size > BATCH_SIZE || paths.is_empty() || paths.len() > MAX_PATHS {
+        return Err("invalid closure query size".into());
+    }
+    let mut request = Request {
+        version: 1,
+        paths: Vec::new(),
+    };
+    for batch in paths.chunks(batch_size) {
+        let parsed = manifest(&metadata_batch(nix, prefix, batch)?)?;
+        if parsed.paths.iter().map(|p| &p.path).ne(batch.iter()) {
+            return Err("Nix metadata differs from requested closure paths".into());
+        }
+        request.paths.extend(parsed.paths);
+        // Bound the actual signing payload, not unrelated Nix registration data.
+        if serde_json::to_vec(&request)
+            .map_err(|e| e.to_string())?
+            .len()
+            > LIMIT
+        {
+            return Err("closure signing request exceeds limit".into());
+        }
+    }
+    for info in &request.paths {
+        if info
+            .references
+            .iter()
+            .any(|reference| paths.binary_search(reference).is_err())
+        {
+            return Err("closure metadata references a path outside the closure".into());
+        }
+    }
+    Ok(request)
+}
+pub fn sign(system: &Path, roots: &Path, command: &Path, args: &[String]) -> Result<(), String> {
+    let paths = closure_paths("nix", &[], system)?;
+    let request = query_manifest("nix", &[], &paths, BATCH_SIZE)?;
     let input = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
     let response = external_signing::exchange_limit(
         command.to_str().ok_or("non-UTF8 signer path")?,
@@ -220,28 +324,20 @@ pub fn sign(system: &Path, roots: &Path, command: &Path, args: &[String]) -> Res
     if !status.success() {
         return Err("importing external closure signatures failed".into());
     }
-    let imported = Command::new("nix")
-        .args([
-            "--extra-experimental-features",
-            "nix-command",
-            "path-info",
-            "--recursive",
-            "--json",
-        ])
-        .arg(system)
-        .managed_output_inherit_stderr()
-        .map_err(|e| e.to_string())?;
-    if !imported.status.success() {
-        return Err("checking imported signatures failed".into());
-    }
-    let observed: serde_json::Value =
-        serde_json::from_slice(&imported.stdout).map_err(|e| e.to_string())?;
-    for (path, signature) in signed {
-        if !observed[&path]["signatures"]
-            .as_array()
-            .is_some_and(|s| s.iter().any(|v| v.as_str() == Some(&signature)))
-        {
-            return Err("Nix did not import an exact requested signature".into());
+    for batch in paths.chunks(BATCH_SIZE) {
+        let bytes = metadata_batch("nix", &[], batch)?;
+        let observed: BTreeMap<String, serde_json::Value> =
+            serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if observed.keys().ne(batch.iter()) {
+            return Err("imported metadata differs from requested paths".into());
+        }
+        for path in batch {
+            if !observed[path]["signatures"]
+                .as_array()
+                .is_some_and(|s| s.iter().any(|v| v.as_str() == Some(&signed[path])))
+            {
+                return Err("Nix did not import an exact requested signature".into());
+            }
         }
     }
     Ok(())
@@ -278,6 +374,45 @@ mod tests {
         ] {
             assert!(signatures(&request, response.to_string().as_bytes()).is_err());
         }
+    }
+    #[test]
+    fn canonical_maximum_path_count_fits_discovery_budget() {
+        let paths: Vec<String> = (0..MAX_PATHS)
+            .map(|i| format!("/nix/store/{i:032}-{}", "n".repeat(222)))
+            .collect();
+        let bytes = format!("{}\n", paths.join("\n")).into_bytes();
+        assert_eq!(bytes.len(), DISCOVERY_LIMIT);
+        assert!(bytes.len() > 1024 * 1024);
+        assert_eq!(parse_paths(&bytes, Path::new(&paths[0])).unwrap(), paths);
+        let excessive = format!("{}{}\n", String::from_utf8(bytes).unwrap(), path());
+        assert!(parse_paths(excessive.as_bytes(), Path::new(&paths[0])).is_err());
+        assert!(
+            parse_paths(
+                format!("{}\n{}\n", path(), path()).as_bytes(),
+                Path::new(path())
+            )
+            .is_err()
+        );
+        assert!(
+            parse_paths(
+                format!("{}\n", path()).as_bytes(),
+                Path::new("/nix/store/missing")
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn verbose_nix_metadata_is_projected_before_signing_budget() {
+        let mut input = serde_json::json!({path(): {"narHash": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "narSize": 13, "references": []}});
+        input[path()]["registrationMetadata"] = serde_json::Value::String("x".repeat(LIMIT));
+        let bytes = serde_json::to_vec(&input).unwrap();
+        assert!(bytes.len() > LIMIT);
+        let parsed = manifest(&bytes).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&parsed).unwrap(),
+            serde_json::to_vec(&request()).unwrap()
+        );
+        assert!(manifest(&vec![b' '; QUERY_LIMIT + 1]).is_err());
     }
     #[test]
     fn rejects_noncanonical_metadata() {
@@ -364,6 +499,47 @@ mod tests {
             )
             .trim(),
             path
+        );
+        let expression =
+            format!("builtins.toFile \"native-signing-root\" (builtins.storePath \"{path}\")");
+        let root = run(
+            &source,
+            &["eval", "--impure", "--raw", "--expr", &expression],
+        )
+        .trim()
+        .to_owned();
+        let prefix = vec![
+            "--option".into(),
+            "build-users-group".into(),
+            "".into(),
+            "--store".into(),
+            source.clone(),
+        ];
+        let paths = closure_paths(&nix, &prefix, Path::new(&root)).unwrap();
+        assert_eq!(
+            paths.len(),
+            2,
+            "real Nix must discover the fixture reference"
+        );
+        let mut oversized = query_command(&nix, &prefix);
+        oversized.args([
+            "eval",
+            "--raw",
+            "--expr",
+            "builtins.concatStringsSep \"\" (builtins.genList (_: \"x\") 1024)",
+        ]);
+        assert!(
+            bounded_query(&mut oversized, 128)
+                .unwrap_err()
+                .contains("bounded output limit")
+        );
+        let batched = query_manifest(&nix, &prefix, &paths, 1).unwrap();
+        let full =
+            manifest(run(&source, &["path-info", "--json", "--recursive", &root]).as_bytes())
+                .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&batched).unwrap(),
+            serde_json::to_vec(&full).unwrap()
         );
         let key = run(
             &source,
