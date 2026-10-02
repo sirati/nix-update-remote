@@ -6,6 +6,7 @@ mod artifact_client;
 mod external_signing;
 mod authorized_keys;
 mod client;
+mod closure_signing;
 mod configured_client;
 mod keygen;
 mod daemon;

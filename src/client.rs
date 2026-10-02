@@ -13,6 +13,8 @@ struct Options {
     signing_key: Option<PathBuf>,
     key_command: Option<PathBuf>,
     key_args: Vec<String>,
+    sign_command: Option<PathBuf>,
+    sign_args: Vec<String>,
     impure: bool,
     activation_command: Option<PathBuf>,
     activation_args: Vec<String>,
@@ -29,38 +31,42 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     }
     let roots = Roots::create()?;
     let system = build(&options, &roots.0.join("system"))?;
-    let mut signing = Command::new("nix");
-    signing.args([
-        "--extra-experimental-features",
-        "nix-command",
-        "store",
-        "sign",
-        "--recursive",
-        "--key-file",
-    ]);
-    if let Some(key) = &options.signing_key {
-        run(signing.arg(key).arg(&system), "signing closure")?;
+    if let Some(command) = &options.sign_command {
+        crate::closure_signing::sign(&system, &roots.0, command, &options.sign_args)?;
     } else {
-        let mut provider =
-            Command::new(options.key_command.as_ref().ok_or("missing key provider")?)
-                .args(&options.key_args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .managed_spawn()
-                .map_err(|e| e.to_string())?;
-        let input = provider
-            .stdout
-            .take()
-            .ok_or("missing key provider output")?;
-        let signed = signing
-            .arg("/proc/self/fd/0")
-            .arg(&system)
-            .stdin(Stdio::from(input))
-            .managed_status()
-            .map_err(|e| e.to_string());
-        let provided = provider.wait().map_err(|e| e.to_string())?;
-        if !provided.success() || !signed?.success() {
-            return Err("signing closure with key provider failed".into());
+        let mut signing = Command::new("nix");
+        signing.args([
+            "--extra-experimental-features",
+            "nix-command",
+            "store",
+            "sign",
+            "--recursive",
+            "--key-file",
+        ]);
+        if let Some(key) = &options.signing_key {
+            run(signing.arg(key).arg(&system), "signing closure")?;
+        } else {
+            let mut provider =
+                Command::new(options.key_command.as_ref().ok_or("missing key provider")?)
+                    .args(&options.key_args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .managed_spawn()
+                    .map_err(|e| e.to_string())?;
+            let input = provider
+                .stdout
+                .take()
+                .ok_or("missing key provider output")?;
+            let signed = signing
+                .arg("/proc/self/fd/0")
+                .arg(&system)
+                .stdin(Stdio::from(input))
+                .managed_status()
+                .map_err(|e| e.to_string());
+            let provided = provider.wait().map_err(|e| e.to_string())?;
+            if !provided.success() || !signed?.success() {
+                return Err("signing closure with key provider failed".into());
+            }
         }
     }
     let store = store_uri(&options.target)?;
@@ -140,6 +146,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut signing_key = None;
     let mut key_command = None;
     let mut key_args = Vec::new();
+    let mut sign_command = None;
+    let mut sign_args = Vec::new();
     let mut impure = false;
     let mut activation_command = None;
     let mut activation_args = Vec::new();
@@ -156,6 +164,10 @@ fn parse(args: &[String]) -> Result<Options, String> {
                 key_command = Some(PathBuf::from(iter.next().ok_or("missing key command")?))
             }
             "--key-arg" => key_args.push(iter.next().ok_or("missing key argument")?.clone()),
+            "--sign-command" => {
+                sign_command = Some(PathBuf::from(iter.next().ok_or("missing sign command")?))
+            }
+            "--sign-arg" => sign_args.push(iter.next().ok_or("missing sign argument")?.clone()),
             "--impure" => impure = true,
             "--ssh-arg" => ssh_args.push(iter.next().ok_or("missing SSH argument")?.clone()),
             "--activation-command" => {
@@ -183,11 +195,23 @@ fn parse(args: &[String]) -> Result<Options, String> {
     if !post_args.is_empty() && post_command.is_none() {
         return Err("post-update arguments require --post-command".into());
     }
-    if signing_key.is_some() == key_command.is_some() {
-        return Err("supply exactly one signing key or key command".into());
+    if [
+        signing_key.is_some(),
+        key_command.is_some(),
+        sign_command.is_some(),
+    ]
+    .into_iter()
+    .filter(|v| *v)
+    .count()
+        != 1
+    {
+        return Err("supply exactly one signing key, key command or external signer".into());
     }
     if !key_args.is_empty() && key_command.is_none() {
         return Err("key arguments require --key-command".into());
+    }
+    if !sign_args.is_empty() && sign_command.is_none() {
+        return Err("sign arguments require --sign-command".into());
     }
     Ok(Options {
         target: target.ok_or("missing --target")?,
@@ -195,6 +219,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         signing_key,
         key_command,
         key_args,
+        sign_command,
+        sign_args,
         impure,
         activation_command,
         activation_args,
@@ -384,6 +410,53 @@ fn run(command: &mut Command, action: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_native_signing_is_exclusive_and_arguments_require_command() {
+        let base = ["--target", "update@example.org", "--installable", ".#host"];
+        let args = |extra: &[&str]| {
+            base.iter()
+                .chain(extra.iter())
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            parse(&args(&[
+                "--sign-command",
+                "external-signer",
+                "--sign-arg",
+                "reason"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            parse(&args(&[
+                "--sign-command",
+                "external-signer",
+                "--signing-key",
+                "/private"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(&args(&[
+                "--sign-command",
+                "external-signer",
+                "--key-command",
+                "provider"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(&args(&[
+                "--signing-key",
+                "/private",
+                "--sign-arg",
+                "orphan"
+            ]))
+            .is_err()
+        );
+    }
 
     #[test]
     fn target_requires_one_user_and_supports_ipv6() {

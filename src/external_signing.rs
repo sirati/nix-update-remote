@@ -33,7 +33,7 @@ struct Signature {
     size: u64,
     signature_base64: String,
 }
-fn decode(text: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn decode(text: &str) -> Result<Vec<u8>, String> {
     if text.is_empty() || text.len() % 4 != 0 || text.len() > 22000 {
         return Err("invalid signature encoding length".into());
     }
@@ -93,13 +93,21 @@ fn validate(manifest: &Manifest, bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8
     Ok(result)
 }
 fn exchange(command: &str, args: &[String], input: Vec<u8>) -> Result<Vec<u8>, String> {
-    if input.len() > LIMIT {
+    exchange_limit(command, args, input, LIMIT)
+}
+pub(crate) fn exchange_limit(
+    command: &str,
+    args: &[String],
+    input: Vec<u8>,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    if input.len() > limit {
         return Err("signing manifest exceeds limit".into());
     }
     // A small explicit pipe bounds transport buffering independently of the
     // host's pipe defaults; the writer remains concurrent with the response.
-    let (input_read, input_write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
-        .map_err(|e| e.to_string())?;
+    let (input_read, input_write) =
+        rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(|e| e.to_string())?;
     rustix::pipe::fcntl_setpipe_size(&input_write, 4096).map_err(|e| e.to_string())?;
     let mut child = Command::new(command)
         .args(args)
@@ -114,9 +122,9 @@ fn exchange(command: &str, args: &[String], input: Vec<u8>) -> Result<Vec<u8>, S
     let mut output = Vec::new();
     let read = stdout
         .by_ref()
-        .take((LIMIT + 1) as u64)
+        .take((limit + 1) as u64)
         .read_to_end(&mut output);
-    if read.is_err() || output.len() > LIMIT {
+    if read.is_err() || output.len() > limit {
         let _ = child.kill();
     }
     drop(stdout);
@@ -124,7 +132,7 @@ fn exchange(command: &str, args: &[String], input: Vec<u8>) -> Result<Vec<u8>, S
     let written = writer.join().map_err(|_| "signing input thread failed")?;
     let status = status?;
     read.map_err(|e| e.to_string())?;
-    if output.len() > LIMIT {
+    if output.len() > limit {
         return Err("signing response exceeds limit".into());
     }
     if !status.success() {
