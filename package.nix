@@ -5,6 +5,7 @@ pkgs.rustPlatform.buildRustPackage {
   version = "0.1.0";
   src = ./.;
   cargoLock.lockFile = ./Cargo.lock;
+  NIX_UPDATE_TEST_NIX = "${pkgs.nix}/bin/nix";
   NIX_UPDATE_ARTIFACT_TEST_SOURCE = pkgs.writeText "immutable-artifact-test-input" "public test artifact\n";
   NIX_UPDATE_CANCELLATION_TOPLEVEL = pkgs.runCommand "cancellation-test-toplevel" {} ''
     mkdir -p "$out"
