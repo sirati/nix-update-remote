@@ -69,7 +69,20 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
             }
         }
     }
-    let store = store_uri(&options.target)?;
+    let transport = Transport::connect(&options)?;
+    let store = format!("{}?max-connections=1", store_uri(&options.target)?);
+    copy_closure(&system, &store, &transport)?;
+    apply(&options, &system, &transport)?;
+    if let Some(command) = &options.post_command {
+        run(
+            Command::new(command).args(&options.post_args),
+            "post-update operation",
+        )?;
+    }
+    Ok(())
+}
+
+fn copy_closure(system: &Path, store: &str, transport: &Transport) -> Result<(), String> {
     run(
         Command::new("nix")
             .args([
@@ -78,8 +91,9 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
                 "copy",
                 "--to",
             ])
+            .env("NIX_SSHOPTS", transport.nix_options())
             .arg(store)
-            .arg(&system),
+            .arg(system),
         "copying closure",
     )?;
     // Copy skips paths that are already valid on the destination. Those paths
@@ -95,18 +109,12 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
                 "auto",
                 "--store",
             ])
-            .arg(store_uri(&options.target)?)
+            .env("NIX_SSHOPTS", transport.nix_options())
+            .arg(store)
             .arg("--recursive")
-            .arg(&system),
+            .arg(system),
         "copying closure signatures",
     )?;
-    apply(&options, &system)?;
-    if let Some(command) = &options.post_command {
-        run(
-            Command::new(command).args(&options.post_args),
-            "post-update operation",
-        )?;
-    }
     Ok(())
 }
 
@@ -298,11 +306,11 @@ impl Drop for ApplyChild {
     }
 }
 
-fn apply(options: &Options, system: &Path) -> Result<(), String> {
+fn apply(options: &Options, system: &Path, transport: &Transport) -> Result<(), String> {
     let target = &options.target;
     let mut child = ApplyChild(
         Command::new("ssh")
-            .args(&options.ssh_args)
+            .args(transport.channel_args())
             .args(["--", target, "apply"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -316,40 +324,19 @@ fn apply(options: &Options, system: &Path) -> Result<(), String> {
         .ok_or("missing SSH stdin")?
         .write_all(protocol::request(system).as_bytes())
         .map_err(|e| e.to_string())?;
-    let expected = format!("OK {}\n", system.display());
+    let mut response = TimedResponse(child.0.stdout.take().ok_or("missing SSH stdout")?);
     let mut callback_ran = false;
-    if options.activation_command.is_some() {
-        while child.0.try_wait().map_err(|e| e.to_string())?.is_none() {
-            // This restricted read reports configuration activation, rather
-            // than service readiness. /run/current-system changes after the
-            // activation script installs /etc, before service start jobs end.
-            // A repeated update can already have this same configuration.
-            if current_system(target, &options.ssh_args, system)? {
-                activation_callback(options)?;
-                callback_ran = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_secs(1));
-        }
-    }
-    let mut response = Vec::new();
-    child
-        .0
-        .stdout
-        .take()
-        .ok_or("missing SSH stdout")?
-        .take(protocol::MAX_REQUEST + 1)
-        .read_to_end(&mut response)
-        .map_err(|e| e.to_string())?;
-    if response.len() > protocol::MAX_REQUEST as usize {
-        return Err("remote switch response exceeds size limit".into());
-    }
+    let final_line = consume_progress(&mut response, system, || {
+        activation_callback(options)?;
+        callback_ran = true;
+        Ok(())
+    })?;
     let status = child.0.wait().map_err(|error| error.to_string())?;
-    if !status.success() || response != expected.as_bytes() {
+    if !status.success() || final_line != format!("OK {}", system.display()) {
         return Err("remote switch failed or returned an invalid response".into());
     }
-    // Fast activation may complete between polls. The successful broker
-    // reply is stronger evidence, so the callback still runs exactly once.
+    // Legacy brokers emit only the final receipt. Successful completion
+    // still runs the callback exactly once without opening another channel.
     if !callback_ran {
         activation_callback(options)?;
     }
@@ -357,31 +344,152 @@ fn apply(options: &Options, system: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn current_system(target: &str, ssh_args: &[String], system: &Path) -> Result<bool, String> {
-    let mut query = ApplyChild(
-        Command::new("ssh")
-            .args(ssh_args)
-            .args(["--", target, "current-system"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .managed_spawn()
-            .map_err(|e| e.to_string())?,
-    );
-    let mut response = Vec::new();
-    query
-        .0
-        .stdout
-        .take()
-        .ok_or("missing query stdout")?
-        .take(protocol::MAX_REQUEST + 1)
-        .read_to_end(&mut response)
-        .map_err(|e| e.to_string())?;
-    if response.len() > protocol::MAX_REQUEST as usize {
-        return Err("current-system response exceeds size limit".into());
+struct TimedResponse(std::process::ChildStdout);
+impl Read for TimedResponse {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+        let mut descriptors = [PollFd::new(&self.0, PollFlags::IN)];
+        let timeout = Timespec {
+            tv_sec: 600,
+            tv_nsec: 0,
+        };
+        if poll(&mut descriptors, Some(&timeout))? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "remote activation produced no progress for 10 minutes; an older broker may need secrets deployed before this upgrade",
+            ));
+        }
+        self.0.read(bytes)
     }
-    let status = query.0.wait().map_err(|e| e.to_string())?;
-    Ok(status.success() && response == format!("{}\n", system.display()).as_bytes())
+}
+
+fn consume_progress(
+    reader: &mut impl Read,
+    system: &Path,
+    mut activated: impl FnMut() -> Result<(), String>,
+) -> Result<String, String> {
+    let expected = format!("ACTIVATED {}", system.display());
+    let mut seen = false;
+    for _ in 0..2 {
+        let line = protocol::read_control_line(reader)?;
+        if line == expected && !seen {
+            seen = true;
+            activated()?;
+        } else if line == format!("OK {}", system.display()) || line == "ERR update rejected" {
+            let mut byte = [0];
+            if reader.read(&mut byte).map_err(|e| e.to_string())? != 0 {
+                return Err("trailing remote switch response".into());
+            }
+            return Ok(line);
+        } else {
+            return Err("invalid or duplicate activation progress event".into());
+        }
+    }
+    Err("missing final remote switch result".into())
+}
+
+struct Transport {
+    directory: PathBuf,
+    master: Option<crate::cancellation::ManagedChild>,
+    target: String,
+    args: Vec<String>,
+}
+impl Transport {
+    fn connect(options: &Options) -> Result<Self, String> {
+        use std::os::unix::fs::DirBuilderExt;
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("nur-{}-{stamp}", std::process::id()));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .map_err(|e| e.to_string())?;
+        let mut transport = Self {
+            args: vec![
+                "-o".into(),
+                format!("ControlPath={}", directory.join("ssh").display()),
+                "-o".into(),
+                "ControlMaster=no".into(),
+                "-o".into(),
+                "ControlPersist=no".into(),
+                "-o".into(),
+                "ProxyCommand=false".into(),
+            ],
+            directory,
+            master: None,
+            target: options.target.clone(),
+        };
+        let mut command = Command::new("ssh");
+        command
+            .args([
+                "-M",
+                "-N",
+                "-T",
+                "-o",
+                "ControlMaster=yes",
+                "-o",
+                "ControlPersist=no",
+                "-o",
+                "ForkAfterAuthentication=no",
+                "-o",
+                "PermitLocalCommand=no",
+            ])
+            .args(["-S"])
+            .arg(transport.directory.join("ssh"))
+            .args(&options.ssh_args)
+            .args(["--", &options.target])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
+        transport.master = Some(command.managed_spawn().map_err(|e| e.to_string())?);
+        loop {
+            if transport
+                .master
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                return Err(
+                    "operation SSH connection failed before authentication completed".into(),
+                );
+            }
+            let status = Command::new("ssh")
+                .args(transport.channel_args())
+                .args(["-O", "check", "--", &transport.target])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .managed_status()
+                .map_err(|e| e.to_string())?;
+            if status.success() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(transport)
+    }
+    fn channel_args(&self) -> &[String] {
+        &self.args
+    }
+    fn nix_options(&self) -> String {
+        self.args
+            .iter()
+            .map(|arg| format!("'{}'", arg.replace('\'', "'\"'\"'")))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+impl Drop for Transport {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.master.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = fs::remove_dir_all(&self.directory);
+    }
 }
 
 fn activation_callback(options: &Options) -> Result<(), String> {
@@ -410,6 +518,114 @@ fn run(command: &mut Command, action: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires the normal integration SSH receiver"]
+    fn real_nix_transport_lost_master_never_reauthenticates() {
+        let target = std::env::var("NIX_UPDATE_TRANSPORT_TEST_TARGET").unwrap();
+        let system = PathBuf::from(std::env::var("NIX_UPDATE_TRANSPORT_TEST_SYSTEM").unwrap());
+        let args: Vec<String> =
+            serde_json::from_str(&std::env::var("NIX_UPDATE_TRANSPORT_TEST_ARGS").unwrap())
+                .unwrap();
+        let mut cli = vec![
+            "--target".into(),
+            target.clone(),
+            "--installable".into(),
+            "fixture".into(),
+            "--key-command".into(),
+            "/unused-provider".into(),
+        ];
+        for arg in args {
+            cli.extend(["--ssh-arg".into(), arg]);
+        }
+        let options = parse(&cli).unwrap();
+        let mut transport = Transport::connect(&options).unwrap();
+        let directory = transport.directory.clone();
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let store = format!("{}?max-connections=1", store_uri(&target).unwrap());
+        copy_closure(&system, &store, &transport).unwrap();
+        let mut master = transport.master.take().unwrap();
+        master.kill().unwrap();
+        master.wait().unwrap();
+        assert!(
+            copy_closure(&system, &store, &transport).is_err(),
+            "lost master silently opened another connection"
+        );
+        let status = Command::new("ssh")
+            .args(transport.channel_args())
+            .args(["--", &target, "apply"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "apply reconnected after master loss");
+        drop(transport);
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn activation_callback_precedes_final_receipt_on_same_stream() {
+        let (mut server, mut client) = std::os::unix::net::UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (notice, confirmed) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            server
+                .write_all(b"ACTIVATED /nix/store/test-system\n")
+                .unwrap();
+            confirmed.recv_timeout(Duration::from_secs(2)).unwrap();
+            server.write_all(b"OK /nix/store/test-system\n").unwrap();
+        });
+        let mut callbacks = 0;
+        let receipt = consume_progress(&mut client, Path::new("/nix/store/test-system"), || {
+            callbacks += 1;
+            notice.send(()).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(callbacks, 1);
+        assert_eq!(receipt, "OK /nix/store/test-system");
+        writer.join().unwrap();
+    }
+    #[test]
+    fn progress_is_not_final_success_and_invalid_events_are_rejected() {
+        let system = Path::new("/nix/store/test-system");
+        let mut callbacks = 0;
+        let result = consume_progress(
+            &mut &b"ACTIVATED /nix/store/test-system\nERR update rejected\n"[..],
+            system,
+            || {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(callbacks, 1);
+        assert_eq!(result, "ERR update rejected");
+        for bytes in [
+            b"ACTIVATED /nix/store/wrong\n".as_slice(),
+            b"ACTIVATED /nix/store/test-system\nACTIVATED /nix/store/test-system\n",
+            b"OK /nix/store/test-system\nextra",
+            b"ACTIVATED /nix/store/test-system\n",
+        ] {
+            assert!(consume_progress(&mut &bytes[..], system, || Ok(())).is_err());
+        }
+        let mut callbacks = 0;
+        assert_eq!(
+            consume_progress(&mut &b"OK /nix/store/test-system\n"[..], system, || {
+                callbacks += 1;
+                Ok(())
+            })
+            .unwrap(),
+            "OK /nix/store/test-system"
+        );
+        assert_eq!(callbacks, 0); // apply owns legacy completion callback.
+    }
 
     #[test]
     fn external_native_signing_is_exclusive_and_arguments_require_command() {

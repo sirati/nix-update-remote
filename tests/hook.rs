@@ -2,7 +2,9 @@ use std::fs::OpenOptions;
 use std::io::Write;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if cfg!(blocked_report) {
+    // The event may be consumed before the candidate delivery unit replaces
+    // the current one. Both fixture generations honor the runtime barrier.
+    if cfg!(blocked_report) || std::path::Path::new("/tmp/update-hook-block").exists() {
         std::fs::write("/tmp/update-hook-blocked", b"waiting")?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         while std::path::Path::new("/tmp/update-hook-block").exists() {

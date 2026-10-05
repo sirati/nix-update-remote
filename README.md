@@ -188,3 +188,14 @@ removed on exit. Backend GC roots remain alive through the postdeployment step.
 SIGINT and SIGTERM cancel deployment, terminate and reap owned child process groups, and remove the command’s temporary signed artifacts, public SSH key files, and repository GC roots. Signing and upload pipes are closed before cleanup.
 
 SIGKILL and machine failure cannot run cleanup. Their leftovers remain visible in the checkout (`system-update-*`); remove an abandoned transaction only after confirming its operator processes have stopped. Active transactions must retain their roots until completion.
+
+The native client uses one operation-owned SSH connection for copying the
+closure and signatures and applying it. Activation progress travels on the
+apply stream; it opens no status connections. The private control socket and
+connection are removed on completion or cancellation. Losing that connection
+fails the operation instead of opening a new authentication request. Pass
+connection options with repeated `--ssh-arg` arguments; these configure the
+single connection used by every phase. Older receivers that return only a
+final receipt remain supported, with the activation callback running after
+successful completion. Such a receiver may require secrets to be deployed
+before its first upgrade if service startup is waiting for them.

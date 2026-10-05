@@ -80,7 +80,7 @@ pub fn read_control_line(stream: &mut impl std::io::Read) -> Result<String, Stri
         let mut byte = [0];
         stream
             .read_exact(&mut byte)
-            .map_err(|_| "truncated control header")?;
+            .map_err(|error| format!("reading control header: {error}"))?;
         if byte[0] == b'\n' {
             break;
         }

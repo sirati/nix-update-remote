@@ -77,17 +77,40 @@ fn proxy_apply() -> Result<(), String> {
     socket
         .shutdown(Shutdown::Write)
         .map_err(|error| error.to_string())?;
-    let mut response = Vec::new();
-    socket
-        .read_to_end(&mut response)
-        .map_err(|error| error.to_string())?;
-    io::stdout()
-        .write_all(&response)
-        .map_err(|error| error.to_string())?;
-    response
-        .starts_with(b"OK ")
-        .then_some(())
-        .ok_or("update daemon rejected the request".into())
+    relay_apply_response(&mut socket, &mut io::stdout(), &system)
+}
+
+fn relay_apply_response(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    system: &Path,
+) -> Result<(), String> {
+    let mut activated = false;
+    for _ in 0..2 {
+        let line = protocol::read_control_line(reader)?;
+        let progress = line == format!("ACTIVATED {}", system.display());
+        let success = line == format!("OK {}", system.display());
+        let failure = line == "ERR update rejected";
+        if progress && !activated {
+            activated = true;
+        } else if !success && !failure {
+            return Err("invalid broker activation response".into());
+        }
+        writeln!(writer, "{line}").map_err(|e| e.to_string())?;
+        writer.flush().map_err(|e| e.to_string())?;
+        if success || failure {
+            let mut trailing = [0];
+            if reader.read(&mut trailing).map_err(|e| e.to_string())? != 0 {
+                return Err("trailing broker response".into());
+            }
+            return if success {
+                Ok(())
+            } else {
+                Err("update daemon rejected the request".into())
+            };
+        }
+    }
+    Err("missing final broker activation response".into())
 }
 
 fn trust_from_environment() -> Result<(Vec<String>, Option<std::path::PathBuf>), String> {
@@ -122,4 +145,51 @@ fn proxy_artifact() -> Result<(), String> {
         .starts_with(b"OK ")
         .then_some(())
         .ok_or("update daemon rejected the artifact".into())
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    #[test]
+    fn login_proxy_flushes_progress_before_broker_completion() {
+        let (mut broker, mut input) = UnixStream::pair().unwrap();
+        let (mut output, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let proxy = std::thread::spawn(move || {
+            relay_apply_response(&mut input, &mut output, Path::new("/nix/store/test-system"))
+        });
+        broker
+            .write_all(b"ACTIVATED /nix/store/test-system\n")
+            .unwrap();
+        assert_eq!(
+            protocol::read_control_line(&mut client).unwrap(),
+            "ACTIVATED /nix/store/test-system"
+        );
+        broker.write_all(b"OK /nix/store/test-system\n").unwrap();
+        broker.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(
+            protocol::read_control_line(&mut client).unwrap(),
+            "OK /nix/store/test-system"
+        );
+        assert!(proxy.join().unwrap().is_ok());
+    }
+    #[test]
+    fn login_proxy_rejects_duplicate_or_wrong_progress_and_preserves_failure() {
+        for bytes in [
+            b"ACTIVATED /nix/store/wrong\n".as_slice(),
+            b"ACTIVATED /nix/store/test-system\nACTIVATED /nix/store/test-system\n",
+            b"ACTIVATED /nix/store/test-system\nERR update rejected\n",
+        ] {
+            assert!(
+                relay_apply_response(
+                    &mut &bytes[..],
+                    &mut Vec::new(),
+                    Path::new("/nix/store/test-system")
+                )
+                .is_err()
+            );
+        }
+    }
 }

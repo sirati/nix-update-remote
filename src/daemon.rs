@@ -1,3 +1,4 @@
+use crate::cancellation::ManagedCommand;
 use crate::{protocol, verify};
 use std::fs;
 use std::io::{Read, Write};
@@ -251,7 +252,7 @@ fn apply_request(stream: &mut UnixStream, options: &Options) -> Result<(PathBuf,
                 .arg(&resolved),
             "setting system profile",
         )?;
-        verify::checked(Command::new(&switch).arg("switch"), "activating system")?;
+        activate_with_progress(Command::new(&switch).arg("switch"), &resolved, stream)?;
         Ok::<(), String>(())
     })();
     let result = if activation.is_ok() {
@@ -262,6 +263,37 @@ fn apply_request(stream: &mut UnixStream, options: &Options) -> Result<(PathBuf,
     record_event(options, &resolved, "after", result);
     activation?;
     Ok((resolved, false))
+}
+
+fn activate_with_progress(
+    command: &mut Command,
+    system: &std::path::Path,
+    stream: &mut impl Write,
+) -> Result<(), String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .managed_spawn()
+        .map_err(|e| e.to_string())?;
+    let mut announced = false;
+    loop {
+        if !announced && fs::read_link("/run/current-system").is_ok_and(|path| path == system) {
+            // Progress means /etc and current-system are installed, not that
+            // service start jobs succeeded. A disconnected client must not
+            // interrupt an activation already owned by the broker.
+            let _ = writeln!(stream, "ACTIVATED {}", system.display());
+            let _ = stream.flush();
+            announced = true;
+        }
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            return status
+                .success()
+                .then_some(())
+                .ok_or_else(|| format!("activating system failed: {status}"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 fn apply_artifact(stream: &mut UnixStream, options: &Options) -> Result<(PathBuf, bool), String> {

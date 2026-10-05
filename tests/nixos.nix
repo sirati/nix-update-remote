@@ -2,6 +2,17 @@
 
 let
   updater = import ../package.nix { inherit pkgs; };
+  transportTest = updater.overrideAttrs (old: {
+    postInstall = (old.postInstall or "") + ''
+      mkdir -p "$out/libexec"
+      for candidate in target/x86_64-unknown-linux-gnu/release/deps/nix_update_remote-*; do
+        if test -f "$candidate" && test -x "$candidate" && "$candidate" --list > transport-test-list 2>/dev/null && grep -q real_nix_transport_lost_master_never_reauthenticates transport-test-list; then
+          cp "$candidate" "$out/libexec/transport-tests"
+        fi
+      done
+      test -x "$out/libexec/transport-tests"
+    '';
+  });
   testHook = pkgs.runCommand "update-hook-fixture" { nativeBuildInputs = [ pkgs.rustc pkgs.stdenv.cc ]; } ''
     mkdir -p $out/bin
     rustc --edition 2024 ${./hook.rs} -o $out/bin/update-hook-fixture
@@ -250,14 +261,27 @@ in
 
     # A service waits for a deployment prerequisite. The real client must
     # invoke its external activation callback before the switch can finish.
+    import json
+    transport_args = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-i", "/root/.ssh/update-b"]
+    transport_auth_before = machine.succeed("journalctl -u sshd.service --no-pager -o cat").count("Accepted publickey for update ")
+    client.succeed("NIX_UPDATE_TRANSPORT_TEST_TARGET=update@machine "
+                   + "NIX_UPDATE_TRANSPORT_TEST_SYSTEM=" + shlex.quote(second) + " "
+                   + "NIX_UPDATE_TRANSPORT_TEST_ARGS=" + shlex.quote(json.dumps(transport_args)) + " "
+                   + "${transportTest}/libexec/transport-tests --ignored --exact client::tests::real_nix_transport_lost_master_never_reauthenticates")
+    assert machine.succeed("journalctl -u sshd.service --no-pager -o cat").count("Accepted publickey for update ") == transport_auth_before + 1
     machine.succeed("touch /tmp/update-hook-block")
     machine.succeed(f"nix --extra-experimental-features nix-command store sign -r --key-file /run/update-signing-b {gated}")
     client.succeed(f"NIX_SSHOPTS='{nix_ssh_b}' nix --extra-experimental-features nix-command --option trusted-public-keys {shlex.quote(trusted_copy_key)} copy --from ssh-ng://update@machine {gated}")
+    # Real sshd authentication counts cover Nix copy, copy-sigs and the
+    # long-lived apply progress channel together, not merely mocked argv.
+    def update_authentications():
+        return machine.succeed("journalctl -u sshd.service --no-pager -o cat").count("Accepted publickey for update ")
+    auth_before_gated = update_authentications()
     gated_command = f"cd /root && NIX_SSHOPTS='{nix_ssh_b}' ${updater}/bin/nix-update-remote deploy --ssh-arg -o --ssh-arg BatchMode=yes --target update@machine --installable {gated} --key-command ${pkgs.coreutils}/bin/cat --key-arg /root/client-update-key --activation-command ${activationFixture}/bin/update-activation-fixture --activation-arg client"
     client.succeed(f"(task_status=0; {gated_command} || task_status=$?; echo $task_status > /root/gated-update.status) > /root/gated-update.log 2>&1 </dev/null &")
     client.wait_until_succeeds("test -f /root/activation-callback-started", timeout=90)
     machine.succeed("grep -Fx gated /etc/remote-update-generation")
-    machine.wait_until_succeeds("test -f /tmp/update-hook-blocked")
+    machine.wait_until_succeeds("test -f /tmp/update-hook-blocked", timeout=90)
     assert machine.succeed("systemctl show activation-gate.service -p ActiveState --value").strip() == "activating"
     client.fail("test -f /root/gated-update.status")
     client.succeed("touch /root/activation-callback-finish")
@@ -265,6 +289,8 @@ in
     machine.succeed("touch /run/activation-gate-ready")
     client.wait_until_succeeds("test -f /root/gated-update.status", timeout=90)
     client.succeed("grep -Fx 0 /root/gated-update.status")
+    assert update_authentications() == auth_before_gated + 1, "update opened more than one authenticated SSH connection"
+    client.succeed("test -z \"$(find /tmp -maxdepth 1 -name 'nur-*')\"")
     machine.wait_for_unit("activation-gate.service")
     # Reporting is still blocked; the production update already succeeded.
     machine.succeed("test -f /tmp/update-hook-block; systemctl is-active system-update-report-delivery.service")
