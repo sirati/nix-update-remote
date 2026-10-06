@@ -61,6 +61,12 @@ verified recovery update. Each hook receives `UPDATE_PHASE`, `UPDATE_RESULT`,
 clears the rest of its environment except `hookPath`. The section on durable
 notifications below gives the delivery rules.
 
+Before activation, the host checks that every path in the closure carries an
+Ed25519 signature by one of the configured update keys. Content-addressed
+paths get no exemption. Nix trusts those by hash, and any account that reaches
+the store, the update account included, can add them. The host also checks
+that each path's contents match its recorded NAR hash.
+
 The integration VM tests the restricted SSH account, validation on both sides,
 process identity checks, signature rejection, key replacement, closure copy,
 hook ordering and privilege, and activation.

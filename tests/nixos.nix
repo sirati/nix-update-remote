@@ -186,6 +186,35 @@ in
     assert events == [f"before pending {first}", f"after success {first}"]
     machine.succeed("test $(stat -c %U /tmp/update-hook-events) = update-notifier")
 
+    import json
+    # SSH access alone can add content-addressed paths that Nix treats as
+    # trusted without signatures. Such a hash-correct toplevel must not switch.
+    client.succeed(
+      "mkdir -p /root/unsigned-system/bin",
+      "echo unsigned > /root/unsigned-system/nixos-version",
+      "printf '#!/bin/sh\\ntouch /run/unsigned-system-activated\\n' "
+      "> /root/unsigned-system/bin/switch-to-configuration",
+      "chmod 0755 /root/unsigned-system/bin/switch-to-configuration",
+    )
+    unsigned = client.succeed(
+      f"NIX_SSHOPTS='{nix_ssh_a}' nix --extra-experimental-features nix-command "
+      "store add --store ssh-ng://update@machine --name nixos-system-unsigned "
+      "/root/unsigned-system"
+    ).strip()
+    unsigned_info = json.loads(machine.succeed(
+      f"nix --extra-experimental-features nix-command path-info --json --json-format 1 {unsigned}"
+    ))[unsigned]
+    assert unsigned_info["ca"] and unsigned_info["signatures"] == [], unsigned_info
+    machine.succeed(
+      "nix --extra-experimental-features nix-command --option trusted-public-keys "
+      f"\"$(cat /run/update-public-a)\" store verify --sigs-needed 1 {unsigned}"
+    )
+    client.fail(
+      f"printf 'NIX_UPDATE_REMOTE_1\\nSWITCH\\n{unsigned}\\n' | {ssh_a} apply"
+    )
+    machine.fail("test -e /run/unsigned-system-activated")
+    machine.succeed("grep -Fx first /etc/remote-update-generation")
+
     client.succeed("ssh-keygen -q -t ed25519 -N \"\" -f /root/.ssh/update-b")
     key_b = client.succeed("base64 -w0 /root/.ssh/update-b.pub").strip()
     machine.succeed(
@@ -227,7 +256,7 @@ in
     )
     machine.succeed(
       "journalctl -u nix-update-remote.service --no-pager | "
-      "grep -F 'rejected update: verifying closure failed'"
+      "grep -F 'lacks a signature by a trusted update key'"
     )
     machine.succeed("grep -Fx first /etc/remote-update-generation")
 

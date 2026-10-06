@@ -1,4 +1,4 @@
-use crate::protocol;
+use crate::{closure_signing, protocol};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -37,19 +37,22 @@ pub fn closure(
     if keys.is_empty() {
         return Err("no trusted signing keys are configured".into());
     }
+    // `nix store verify` counts content-addressed paths as signed, so it only
+    // checks contents here; the update key signature is checked separately.
     checked(
         Command::new(nix)
             .args([
                 "--extra-experimental-features",
                 "nix-command",
-                "--option",
-                "trusted-public-keys",
+                "store",
+                "verify",
+                "--recursive",
+                "--no-trust",
             ])
-            .arg(keys.join(" "))
-            .args(["store", "verify", "--recursive", "--sigs-needed", "1"])
             .arg(system),
-        "verifying closure",
-    )
+        "verifying closure contents",
+    )?;
+    closure_signing::require_signed(nix, system, &keys)
 }
 
 pub fn checked(command: &mut Command, action: &str) -> Result<(), String> {

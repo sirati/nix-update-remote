@@ -30,6 +30,9 @@ struct PathInfo {
     nar_hash: String,
     nar_size: u64,
     references: Vec<String>,
+    // Host-side verification input only; never part of the signing request.
+    #[serde(skip)]
+    signatures: Vec<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +40,8 @@ struct RawInfo {
     nar_hash: String,
     nar_size: u64,
     references: Vec<String>,
+    #[serde(default)]
+    signatures: Vec<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -126,6 +131,7 @@ fn manifest(bytes: &[u8]) -> Result<Request, String> {
             nar_hash: canonical_hash(&info.nar_hash)?,
             nar_size: info.nar_size,
             references,
+            signatures: info.signatures,
         });
     }
     Ok(Request { version: 1, paths })
@@ -342,6 +348,75 @@ pub fn sign(system: &Path, roots: &Path, command: &Path, args: &[String]) -> Res
     }
     Ok(())
 }
+fn fingerprint(info: &PathInfo) -> String {
+    format!(
+        "1;{};{};{};{}",
+        info.path,
+        info.nar_hash,
+        info.nar_size,
+        info.references.join(",")
+    )
+}
+type TrustedKeys = Vec<(String, ed25519_dalek::VerifyingKey)>;
+fn parse_keys(keys: &[String]) -> Result<TrustedKeys, String> {
+    let mut parsed = Vec::new();
+    for key in keys.iter().map(|k| k.trim()).filter(|k| !k.is_empty()) {
+        let (name, encoded) = key.split_once(':').ok_or("unnamed Nix public key")?;
+        let bytes: [u8; 32] = external_signing::decode(encoded)?
+            .try_into()
+            .map_err(|_| "invalid Nix Ed25519 public key length")?;
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&bytes)
+            .map_err(|_| "invalid Nix Ed25519 public key")?;
+        if name.is_empty() {
+            return Err("unnamed Nix public key".into());
+        }
+        parsed.push((name.to_owned(), key));
+    }
+    if parsed.is_empty() {
+        return Err("no trusted signing keys are configured".into());
+    }
+    Ok(parsed)
+}
+fn signed_by(info: &PathInfo, keys: &TrustedKeys) -> bool {
+    let message = fingerprint(info);
+    info.signatures.iter().any(|signature| {
+        let Some((name, encoded)) = signature.split_once(':') else {
+            return false;
+        };
+        let Ok(Ok(bytes)) = external_signing::decode(encoded).map(<[u8; 64]>::try_from) else {
+            return false;
+        };
+        let signature = ed25519_dalek::Signature::from_bytes(&bytes);
+        keys.iter().any(|(key_name, key)| {
+            key_name == name && key.verify_strict(message.as_bytes(), &signature).is_ok()
+        })
+    })
+}
+fn check_signed(paths: &[PathInfo], keys: &TrustedKeys) -> Result<(), String> {
+    match paths.iter().find(|info| !signed_by(info, keys)) {
+        Some(info) => Err(format!(
+            "{} lacks a signature by a trusted update key",
+            info.path
+        )),
+        None => Ok(()),
+    }
+}
+/// Every closure path must carry a valid signature by a configured update key.
+/// Unlike `nix store verify`, content-addressed paths get no exemption: any
+/// store user can add those, so their hash proves integrity, not approval.
+pub fn require_signed(nix: &Path, system: &Path, keys: &[String]) -> Result<(), String> {
+    require_signed_in(nix.to_str().ok_or("non-UTF8 Nix path")?, &[], system, keys)
+}
+fn require_signed_in(
+    nix: &str,
+    prefix: &[String],
+    system: &Path,
+    keys: &[String],
+) -> Result<(), String> {
+    let keys = parse_keys(keys)?;
+    let paths = closure_paths(nix, prefix, system)?;
+    check_signed(&query_manifest(nix, prefix, &paths, BATCH_SIZE)?.paths, &keys)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +488,62 @@ mod tests {
             serde_json::to_vec(&request()).unwrap()
         );
         assert!(manifest(&vec![b' '; QUERY_LIMIT + 1]).is_err());
+    }
+    #[test]
+    fn closure_needs_trusted_signature_on_every_path() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let encode = |bytes: &[u8]| {
+            const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let mut n = 0u32;
+                for (i, byte) in chunk.iter().enumerate() {
+                    n |= u32::from(*byte) << (16 - 8 * i);
+                }
+                for i in 0..4 {
+                    out.push(match i <= chunk.len() {
+                        true => B64[(n >> (18 - 6 * i) & 63) as usize] as char,
+                        false => '=',
+                    });
+                }
+            }
+            out
+        };
+        let operator = SigningKey::from_bytes(&[7; 32]);
+        let stranger = SigningKey::from_bytes(&[9; 32]);
+        let public = format!("update-1:{}", encode(operator.verifying_key().as_bytes()));
+        let keys = parse_keys(&[public.clone()]).unwrap();
+        let sign = |key: &SigningKey, name: &str, info: &PathInfo| {
+            format!("{name}:{}", encode(&key.sign(fingerprint(info).as_bytes()).to_bytes()))
+        };
+        let mut info = request().paths.remove(0);
+        assert_eq!(
+            fingerprint(&info),
+            format!("1;{};sha256:{};13;", path(), "0".repeat(52))
+        );
+        // Hash-correct metadata with no signature, a foreign signature, or a
+        // trusted key under the wrong name never authorizes activation.
+        assert!(check_signed(std::slice::from_ref(&info), &keys).is_err());
+        info.signatures = vec![sign(&stranger, "update-1", &info)];
+        assert!(check_signed(std::slice::from_ref(&info), &keys).is_err());
+        info.signatures = vec![sign(&operator, "other", &info)];
+        assert!(check_signed(std::slice::from_ref(&info), &keys).is_err());
+        info.signatures = vec!["garbage".into(), sign(&operator, "update-1", &info)];
+        check_signed(std::slice::from_ref(&info), &keys).unwrap();
+        let mut tampered = PathInfo {
+            nar_size: 14,
+            signatures: info.signatures.clone(),
+            ..request().paths.remove(0)
+        };
+        assert!(check_signed(std::slice::from_ref(&tampered), &keys).is_err());
+        tampered.nar_size = 13;
+        tampered.references = vec![path().into()];
+        assert!(check_signed(std::slice::from_ref(&tampered), &keys).is_err());
+        let unsigned = request().paths.remove(0);
+        assert!(check_signed(&[info, unsigned], &keys).is_err());
+        assert!(parse_keys(&[]).is_err());
+        assert!(parse_keys(&["update-1".into()]).is_err());
+        assert!(parse_keys(&[":".to_owned() + &public[9..]]).is_err());
     }
     #[test]
     fn rejects_noncanonical_metadata() {
@@ -605,16 +736,15 @@ mod tests {
             narinfo(&request.paths[0], signature),
         )
         .unwrap();
-        run(
-            &destination,
-            &[
-                "store",
-                "copy-sigs",
-                "--substituter",
-                &format!("file://{}", cache.display()),
-                &path,
-            ],
-        );
+        let destination_prefix = vec![
+            "--option".into(),
+            "build-users-group".into(),
+            "".into(),
+            "--store".into(),
+            destination.clone(),
+        ];
+        let keys = vec![public.trim().to_owned()];
+        // Nix itself accepts the unsigned content-addressed path as trusted.
         run(
             &destination,
             &[
@@ -629,6 +759,27 @@ mod tests {
                 &path,
             ],
         );
+        assert!(
+            require_signed_in(&nix, &destination_prefix, Path::new(&path), &keys)
+                .unwrap_err()
+                .contains("lacks a signature"),
+            "an unsigned hash-correct path must not authorize activation"
+        );
+        run(
+            &destination,
+            &[
+                "store",
+                "copy-sigs",
+                "--substituter",
+                &format!("file://{}", cache.display()),
+                &path,
+            ],
+        );
+        require_signed_in(&nix, &destination_prefix, Path::new(&path), &keys).unwrap();
+        let other = vec![format!("native-signing-test:{}", "A".repeat(43) + "=")];
+        assert!(require_signed_in(&nix, &destination_prefix, Path::new(&path), &other).is_err());
+        // The unsigned root referencing the signed path still fails as a closure.
+        assert!(require_signed_in(&nix, &prefix, Path::new(&root), &keys).is_err());
         assert_eq!(
             fs::read_dir(cache.join("nar")).unwrap().count(),
             0,
