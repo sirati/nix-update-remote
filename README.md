@@ -1,14 +1,14 @@
 # NixOS remote update
 
-This flake provides a restricted Rust update client, SSH login program, and
-privileged service for remotely deploying signed NixOS closures without root
-SSH or sudo.
+This flake provides a restricted Rust update client, an SSH login program and
+a privileged service. Together they deploy signed NixOS closures to remote
+hosts without root SSH or sudo.
 
-The `update` account has the binary as its login program. Both the
-unprivileged side and the root service validate the requested closure, its
-recursive signatures, allowed keys, and protocol fields. The privileged
-service also checks the connecting process UID and executable identity before
-staging or switching a generation.
+The binary is the login program of the `update` account. The unprivileged
+side and the root service both validate the requested closure, its recursive
+signatures, the allowed keys and the protocol fields. Before it stages or
+switches a generation, the privileged service also checks the UID and
+executable identity of the connecting process.
 
 ```nix
 {
@@ -22,9 +22,9 @@ staging or switching a generation.
 }
 ```
 
-Configure `services.nixUpdateRemote`, place the dedicated SSH public key
-in its runtime `authorizedKeysFile`, and install at least one closure-signing
-public key. Signing private keys stay on the operator machine and outside the
+Configure `services.nixUpdateRemote`, put the dedicated SSH public key in its
+runtime `authorizedKeysFile`, and install at least one public key for closure
+signing. Private signing keys stay on the operator machine and outside the
 Nix store.
 
 ```console
@@ -36,42 +36,48 @@ nix run github:sirati/nix-update-remote -- deploy \
 ```
 
 The client keeps registered GC roots in the checkout until activation and any
-configured `--post-command` finish. Pass repeated `--post-arg` values to request
-secret deployment through your secret manager after a successful switch; the
-updater has no dependency on that manager. Instead of `--signing-key`, a
-`--sign-command` with repeated `--sign-arg` values requests detached signatures
-from an external signer, keeping the private key in that signer. The native
-protocol exchanges version-1 JSON containing canonical Nix path metadata and
-returns one named Ed25519 signature per path. This metadata is requester supplied;
-the protocol does not transfer or verify NAR contents. Signatures are imported
-through Nix's metadata-only cache operation. Alternatively, a structured
-`--key-command` with repeated `--key-arg` values can supply the key
-through a pipe. `keygen NAME` generates an operator key with the private half
-on stdout and the public half on descriptor 3; neither half is written to disk.
+configured `--post-command` have finished. To have your secret manager deploy
+secrets after a successful switch, pass repeated `--post-arg` values. The
+updater does not depend on that manager.
 
-`beforeHooks` and `afterHooks` are immutable notification executables, delivered
-asynchronously from a durable queue under the unprivileged hook identity.
-Delivery failures remain queued and never prevent a verified recovery update.
-Each hook receives `UPDATE_PHASE`, `UPDATE_RESULT`, `UPDATE_SYSTEM`, and the
-original `UPDATE_EVENT_UNIX_SECONDS`; its environment is otherwise cleared
-except for `hookPath`. See the durable notification semantics below.
+In place of `--signing-key`, `--sign-command` with repeated `--sign-arg`
+values asks an external signer for detached signatures. The private key then
+stays in that signer. The native protocol exchanges version-1 JSON that
+contains canonical Nix path metadata, and the signer returns one named Ed25519
+signature per path. The requester supplies this metadata. The protocol does
+not transfer or verify NAR contents. Nix imports the signatures through its
+metadata-only cache operation.
 
-The integration VM covers the restricted SSH account, dual validation,
+A structured `--key-command` with repeated `--key-arg` values can also supply
+the key through a pipe. `keygen NAME` generates an operator key. It writes the
+private half to stdout and the public half to descriptor 3, and writes neither
+half to disk.
+
+`beforeHooks` and `afterHooks` are immutable notification executables. The
+service delivers to them asynchronously from a durable queue, under the
+unprivileged hook identity. Failed deliveries stay queued and never block a
+verified recovery update. Each hook receives `UPDATE_PHASE`, `UPDATE_RESULT`,
+`UPDATE_SYSTEM` and the original `UPDATE_EVENT_UNIX_SECONDS`. The service
+clears the rest of its environment except `hookPath`. The section on durable
+notifications below gives the delivery rules.
+
+The integration VM tests the restricted SSH account, validation on both sides,
 process identity checks, signature rejection, key replacement, closure copy,
 hook ordering and privilege, and activation.
 
 ## Signed artifact integration
 
-`services.nixUpdateRemote.artifact.enable` selects the signed EROFS backend
-instead of signed Nix closures. The same Rust login program and independently
-peer-checked privileged service own both modes. Artifact integrations supply
-only the mutable generation root, trusted public-key file, and immutable
-signature verifier. The account has no shell or sudo permission. Artifact
-headers, payload lengths, content hashes, sidecars, staging and atomic selection
-are handled in Rust. Kernel, initrd, configuration, rescue and optional network
-payload signatures are verified before selecting a generation. An unhealthy
-unconfirmed attempt may be superseded, preserving the last tested fallback;
-only boot health checking can mark a generation tested.
+`services.nixUpdateRemote.artifact.enable` switches from signed Nix closures to
+the signed EROFS backend. Both modes run through the same Rust login program
+and the same privileged service, which checks its peer independently. An
+artifact integration supplies only the mutable generation root, the trusted
+public-key file and the immutable signature verifier. The account has no shell
+and no sudo permission. Rust code handles artifact headers, payload lengths,
+content hashes, sidecars, staging and atomic selection. The service verifies
+the signatures of the kernel, initrd, configuration, rescue and optional
+network payloads before it selects a generation. A new attempt may replace an
+unhealthy unconfirmed attempt, and the last tested fallback stays in place.
+Only the boot health check can mark a generation as tested.
 
 The complete operator transaction is:
 
@@ -81,63 +87,69 @@ nix-update-remote deploy-generation \
   --signing-key /run/keys/generation.key --sha512sum /path/to/sha512sum --reboot
 ```
 
-The integration supplies the image/config/rescue/signer/system attribute mapping
+The integration maps the image, config, rescue, signer and system attributes
 with `--image-attribute`, `--config-attribute`, `--rescue-attribute`,
 `--signer-attribute` and `--system-attribute`. The generic workflow defaults to
-`system.build.updateArtifacts.*` and has no NMBL attribute dependency. Signer
-executable location is supplied with `--signer-relative-path`; optional network
-artifacts use `--network-attribute` and `--network-enabled-attribute`.
-It builds those public outputs, registers GC
-roots in a printed `system-update-roots-*` directory in the current checkout,
-signs and uploads them, and removes roots on success or failure. A process crash
-may leave that visible directory for explicit cleanup. `deploy-artifact` is the
-same signing/upload operation for existing image, config, kernel, initrd and
-rescue files. `--key-command PROGRAM` with repeated `--key-arg ARG` supplies a
-structured runtime key provider through an OS pipe; no shell evaluates it and
-no decrypted private key is written to disk. Repeated `--ssh-arg` options with
-`--ssh-command PROGRAM` integrate an operator authentication provider. These
-providers are operator-controlled; they do not cross the target's privilege
-boundary.
+`system.build.updateArtifacts.*` and does not depend on any NMBL attribute.
+`--signer-relative-path` gives the location of the signer executable. Optional
+network artifacts use `--network-attribute` and `--network-enabled-attribute`.
+
+The command builds those public outputs and registers GC roots in a
+`system-update-roots-*` directory in the current checkout, and prints that
+directory. It then signs and uploads the outputs, and removes the roots on
+success or failure. If the process crashes, the directory may remain and you
+have to clean it up. `deploy-artifact` runs the same signing and upload for
+existing image, config, kernel, initrd and rescue files.
+
+`--key-command PROGRAM` with repeated `--key-arg ARG` supplies a structured
+key provider at runtime through an OS pipe. No shell evaluates it, and no
+decrypted private key is written to disk. `--ssh-command PROGRAM` with
+repeated `--ssh-arg` options plugs in an operator authentication provider.
+The operator controls these providers, and they stay on the operator side of
+the target's privilege boundary.
 
 ## Durable notifications
 
-Events are written and synced to the root-owned `reportQueue`
-(default `/persistent/system-update-reports`): before events precede activation,
-and outcome events follow activation and precede any requested reboot.
-`beforeHooks` and `afterHooks` now deliver these events asynchronously through
-`system-update-report-delivery.service` and its retry timer. Notification keys,
-DNS or SMTP may be unavailable during bootstrap or recovery: verified updates
-still proceed, with failed notifications remaining queued. Queue failures and
-pending delivery are visible in the journal. Delivery retains the original
-`UPDATE_EVENT_UNIX_SECONDS`, clears supplementary groups, drops to the
-configured non-root hook UID/GID and executes only immutable hook programs.
-A delivery outage is expected pending work and does not make the host unhealthy.
+The service writes events to the root-owned `reportQueue`
+(default `/persistent/system-update-reports`) and syncs them to disk. Before
+events come before activation. Outcome events come after activation and before
+any requested reboot. `beforeHooks` and `afterHooks` now receive these events
+asynchronously through `system-update-report-delivery.service` and its retry
+timer. During bootstrap or recovery, notification keys, DNS or SMTP may be
+unavailable. Verified updates still go ahead, and failed notifications stay
+queued. The journal shows queue failures and pending deliveries. Delivery
+keeps the original `UPDATE_EVENT_UNIX_SECONDS`, clears supplementary groups,
+switches to the configured non-root hook UID/GID and runs only immutable hook
+programs. A delivery outage counts as pending work and does not mark the host
+unhealthy.
 
 `UPDATE_PHASE=before`, `UPDATE_RESULT=pending` records the verified candidate
-before mutation. `UPDATE_PHASE=after` records `success` or `failure` of
-activation. For EROFS, success means the generation was selected for the next
-boot; it is not proof of a healthy boot. Failed verification records an after
-failure with candidate `unverified-artifact`, and never changes the selection.
-Delivery is at least once: a crash after mail acceptance and before deleting an
-event may cause a duplicate. Pending events remain on disk if hooks are removed.
+before any change. `UPDATE_PHASE=after` records `success` or `failure` of
+activation. For EROFS, success means the service selected the generation for
+the next boot. It does not prove that the boot was healthy. A failed
+verification records an after failure with candidate `unverified-artifact` and
+never changes the selection. Delivery is at least once. A crash after the mail
+server accepts a message and before the event is deleted may cause a
+duplicate. Pending events stay on disk if you remove the hooks.
 
-The server repository's `system-update-reporting` VM check drives the canonical
-Rust build/sign/SSH operator path and an actual SSH-to-SMTP report receiver. It
-covers missing reporting keys during repair, delayed before/outcome delivery,
-verification failure, and account restrictions. This repository's signed-Nix
-closure VM check covers the same broker and asynchronous hook delivery in
-closure mode.
+The `system-update-reporting` VM check in the server repository runs the
+canonical Rust operator path for build, sign and SSH, and a real SSH-to-SMTP
+report receiver. It tests missing reporting keys during repair, delayed before
+and outcome delivery, verification failure, and account restrictions. The
+signed-Nix closure VM check in this repository tests the same broker and
+asynchronous hook delivery in closure mode.
 
 ### Bootstrap coherence and provisioning
 
-With `artifact.bootstrap.enable`, each signed image must contain fixed regular
-files `/nmbl-bootstrap/kernel` and `/nmbl-bootstrap/initrd`. After verifying the
-image, the Rust adapter mounts it read-only with nodev/nosuid/noexec in a private
-mount namespace and copies those files into the generation. Symlinked metadata
-or missing bootstrap files are rejected. Bootloader integration selects these
-files through the same atomic generation selector as the runtime configuration,
-so rollback selects the matching bootstrap pair too. The caller supplies the
-immutable verifier; utility programs only perform native hashing and mounts.
+With `artifact.bootstrap.enable`, each signed image must contain the fixed
+regular files `/nmbl-bootstrap/kernel` and `/nmbl-bootstrap/initrd`. After it
+verifies the image, the Rust adapter mounts it read-only with
+nodev/nosuid/noexec in a private mount namespace and copies those files into
+the generation. The adapter rejects symlinked metadata and missing bootstrap
+files. The bootloader integration selects these files through the same atomic
+generation selector as the runtime configuration, so a rollback also selects
+the matching bootstrap pair. The caller supplies the immutable verifier. The
+utility programs only do native hashing and mounts.
 
 Initial rescue provisioning uses the same verification and activation code:
 
@@ -146,56 +158,59 @@ nix-update-remote install-erofs ROOT PUBLIC_KEY SIGNER SHA512SUM \
   UNSHARE MOUNT UMOUNT --report-queue QUEUE < signed-bundle
 ```
 
-The optional queue path must match the installed service (including the installation mount prefix).
-This root-only role never requests reboot. Installed hosts use the restricted
-update account and broker. `deploy-generation` accepts `--remote-command PROGRAM`
-and repeated `--remote-arg ARG` for the initial rescue command; arguments are
-quoted individually for SSH. No caller-selected shell code is used by the
-installed restricted service.
+The optional queue path must match the installed service, including the
+installation mount prefix. This root-only role never requests a reboot.
+Installed hosts use the restricted update account and broker.
+`deploy-generation` accepts `--remote-command PROGRAM` and repeated
+`--remote-arg ARG` for the initial rescue command, and quotes each argument
+separately for SSH. The installed restricted service runs no shell code that a
+caller chooses.
 
 Closure updates accept `--activation-command PROGRAM` and repeated
-`--activation-arg ARG`. This callback runs once the restricted `current-system`
-query reports the new configuration, while service startup may still be waiting
-for credentials. The client waits for both the callback and the activation
-result, retaining its checkout GC roots throughout. This lets a secrets provider
-request operator approval without blocking behind services that need its values.
+`--activation-arg ARG`. The client runs this callback as soon as the restricted
+`current-system` query reports the new configuration. At that point service
+startup may still be waiting for credentials. The client waits for both the
+callback and the activation result, and keeps its checkout GC roots the whole
+time. A secrets provider can then ask for operator approval without waiting
+behind services that need its values.
 
 An integration may supply `--post-command PROGRAM` with repeated `--post-arg ARG`
 for operator work after an update. With `--reboot`, the generation workflow waits
 until the restricted SSH `current-system` query matches the built toplevel, then
-executes that configured command. For example, the server integration requests
-its secrets deployment through nix-secrets at this point. The independent
-updater has no dependency on that provider. Without reboot, this post-operation
-is deferred so new-schema secrets cannot be deployed into the old system.
+runs that command. For example, the server integration asks nix-secrets to
+deploy its secrets at this point. The updater does not depend on that provider.
+Without a reboot, the client defers this post-operation, so secrets in a new
+schema cannot be deployed into the old system.
 
 ### Configured operator client
 
 `configured-deploy --installable FLAKE#CONFIG --plan FILE` evaluates a public
 Nix metadata function against that configuration and runs the existing update
 backend. The function supplies argument arrays for an external signing session,
-SSH authentication, key provider, and postdeployment operation. The updater
-remains independent of those providers.
+SSH authentication, a key provider and a post-deployment operation. The updater
+does not depend on those providers.
 
-`--installable`, `--target-host update@HOST`, and `--ssh-port PORT` can select a
+`--installable`, `--target-host update@HOST` and `--ssh-port PORT` can select a
 runtime deployment configuration without rebuilding the application. The SSH
-public key comes from that configuration; target overrides retain its identity
+public key comes from that configuration. Target overrides keep its identity
 and strict host verification. `--no-reboot` suppresses a configured reboot.
-Only the public SSH key is written temporarily beneath the checkout, and it is
-removed on exit. Backend GC roots remain alive through the postdeployment step.
+The client writes only the public SSH key to a temporary file under the
+checkout, and removes it on exit. Backend GC roots stay alive through the
+post-deployment step.
 
 ### Interrupted operator commands
 
-SIGINT and SIGTERM cancel deployment, terminate and reap owned child process groups, and remove the command’s temporary signed artifacts, public SSH key files, and repository GC roots. Signing and upload pipes are closed before cleanup.
+SIGINT and SIGTERM cancel the deployment, terminate and reap the child process groups the command owns, and remove the command's temporary signed artifacts, public SSH key files and repository GC roots. The client closes the signing and upload pipes before cleanup.
 
-SIGKILL and machine failure cannot run cleanup. Their leftovers remain visible in the checkout (`system-update-*`); remove an abandoned transaction only after confirming its operator processes have stopped. Active transactions must retain their roots until completion.
+SIGKILL and machine failure leave no chance to clean up. Their leftovers stay in the checkout as `system-update-*`. Remove an abandoned transaction only after you confirm that its operator processes have stopped. An active transaction must keep its roots until it completes.
 
-The native client uses one operation-owned SSH connection for copying the
-closure and signatures and applying it. Activation progress travels on the
-apply stream; it opens no status connections. The private control socket and
-connection are removed on completion or cancellation. Losing that connection
-fails the operation instead of opening a new authentication request. Pass
-connection options with repeated `--ssh-arg` arguments; these configure the
-single connection used by every phase. Older receivers that return only a
-final receipt remain supported, with the activation callback running after
-successful completion. Such a receiver may require secrets to be deployed
-before its first upgrade if service startup is waiting for them.
+The native client uses one SSH connection per operation to copy the closure and
+signatures and to apply it. Activation progress comes back on the apply stream,
+and the client opens no status connections. The client removes the private
+control socket and the connection on completion or cancellation. If that
+connection drops, the operation fails and the client does not start a new
+authentication request. Pass connection options with repeated `--ssh-arg`
+arguments. They configure the single connection that every phase uses. Older
+receivers that return only a final receipt still work, and the activation
+callback then runs after successful completion. Such a receiver may need the
+secrets deployed before its first upgrade if service startup waits for them.
