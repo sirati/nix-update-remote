@@ -70,6 +70,42 @@ mod staging_tests {
         assert!(stage_source(&directory.0, &directory.0.join("invalid")).is_err());
     }
 }
+/// The `NMBL-EROFS-BUNDLE-4` header for payload sizes in
+/// `artifact::PAYLOADS` order without the system hint (always 0 here).
+pub(crate) fn bundle_header(id: &str, config_id: &str, sizes: &[u64], reboot: bool) -> String {
+    let mut header = format!(
+        "{}\n{id}\n{}\n{}\n0\n{config_id}\n",
+        crate::artifact::BUNDLE_MAGIC,
+        sizes[0],
+        sizes[1]
+    );
+    for size in &sizes[2..] {
+        header.push_str(&format!("{size}\n"));
+    }
+    header.push_str(if reboot { "1\n" } else { "0\n" });
+    header
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    #[test]
+    fn header_carries_tools_sizes_between_network_and_reboot() {
+        let sizes: Vec<u64> = (1..=14).collect();
+        let header = bundle_header(&"a".repeat(128), &"b".repeat(128), &sizes, true);
+        let lines: Vec<&str> = header.lines().collect();
+        assert_eq!(lines.len(), 19);
+        assert_eq!(lines[0], "NMBL-EROFS-BUNDLE-4");
+        assert_eq!(&lines[2..5], ["1", "2", "0"]);
+        assert_eq!(lines[5], "b".repeat(128));
+        assert_eq!(&lines[14..16], ["11", "12"]);
+        assert_eq!(&lines[16..18], ["13", "14"]);
+        assert_eq!(lines[18], "1");
+        assert!(header.ends_with('\n'));
+    }
+}
+
 impl Drop for Temporary {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
@@ -116,7 +152,8 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
             "--signer" => signer = iter.next().map(PathBuf::from),
             "--sha512sum" => hash = iter.next().map(PathBuf::from),
             "--reboot" => reboot = true,
-            "--image" | "--config" | "--kernel" | "--initrd" | "--rescue" | "--network" => {
+            "--image" | "--config" | "--kernel" | "--initrd" | "--rescue" | "--network"
+            | "--tools" => {
                 let value = iter.next().ok_or("missing artifact path")?;
                 sources.insert(arg.as_str(), PathBuf::from(value));
             }
@@ -170,10 +207,11 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
         ("--initrd", "initrd", "gen-initrd"),
         ("--rescue", "rescue.sfs", "rescue-sfs"),
         ("--network", "network.erofs", "network-stage"),
+        ("--tools", "rescue-tools.erofs", "rescue-tools"),
     ];
     for (option, name, domain) in definitions {
         let Some(source) = sources.get(option) else {
-            if option == "--network" {
+            if matches!(option, "--network" | "--tools") {
                 continue;
             }
             return Err(format!("missing {option}"));
@@ -236,44 +274,20 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     };
     let id = digest("nix.erofs")?;
     let config_id = digest("config.toml")?;
-    let names = [
-        "nix.erofs",
-        "nix.erofs.sig",
-        "config.toml",
-        "config.toml.sig",
-        "kernel",
-        "kernel.sig",
-        "initrd",
-        "initrd.sig",
-        "rescue.sfs",
-        "rescue.sfs.sig",
-        "network.erofs",
-        "network.erofs.sig",
-    ];
+    // The operator never sends the unsigned system hint.
+    let names: Vec<&str> = crate::artifact::PAYLOADS
+        .into_iter()
+        .filter(|name| *name != "system")
+        .collect();
     let mut sizes = Vec::new();
-    for name in names {
+    for name in &names {
         sizes.push(
             fs::metadata(temporary.0.join(name))
                 .map(|m| m.len())
                 .unwrap_or(0),
         );
     }
-    let header = format!(
-        "NMBL-EROFS-BUNDLE-3\n{id}\n{}\n{}\n0\n{config_id}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
-        sizes[0],
-        sizes[1],
-        sizes[2],
-        sizes[3],
-        sizes[4],
-        sizes[5],
-        sizes[6],
-        sizes[7],
-        sizes[8],
-        sizes[9],
-        sizes[10],
-        sizes[11],
-        u8::from(reboot)
-    );
+    let header = bundle_header(&id, &config_id, &sizes, reboot);
     let remote = if let Some(command) = remote_command {
         let quoted = |word: &str| format!("'{}'", word.replace('\'', "'\\''"));
         std::iter::once(command)
@@ -300,7 +314,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
         input
             .write_all(header.as_bytes())
             .map_err(|e| e.to_string())?;
-        for name in names {
+        for name in &names {
             let path = temporary.0.join(name);
             if path.exists() {
                 io::copy(

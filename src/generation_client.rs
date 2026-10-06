@@ -48,6 +48,77 @@ fn build(
     }
     Ok(path.into())
 }
+fn eval_bool(
+    nix: &Path,
+    expression: &str,
+    apply: Option<&str>,
+    impure: bool,
+) -> Result<bool, String> {
+    let mut command = Command::new(nix);
+    command.args([
+        "--extra-experimental-features",
+        "nix-command flakes",
+        "eval",
+        "--json",
+    ]);
+    if impure {
+        command.arg("--impure");
+    }
+    command.arg(expression);
+    if let Some(apply) = apply {
+        command.args(["--apply", apply]);
+    }
+    let output = command.managed_output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        return Err("evaluating optional artifact failed".into());
+    }
+    match std::str::from_utf8(&output.stdout)
+        .map_err(|e| e.to_string())?
+        .trim()
+    {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err("optional artifact predicate must be boolean".into()),
+    }
+}
+/// Splits `a.b.leaf` into the parent path and a leaf name that is safe to
+/// quote into a Nix `?` test.
+fn presence_probe(attribute: &str) -> Result<(String, String), String> {
+    let (parent, leaf) = match attribute.rsplit_once('.') {
+        Some((parent, leaf)) => (format!(".{parent}"), leaf),
+        None => (String::new(), attribute),
+    };
+    if leaf.is_empty()
+        || parent == "."
+        || !leaf
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-'".contains(&b))
+    {
+        return Err("invalid optional artifact attribute".into());
+    }
+    Ok((parent, format!("v: v ? \"{leaf}\"")))
+}
+/// An optional artifact is built when its predicate holds, or, without a
+/// predicate, when the configuration defines the attribute at all.
+fn optional_enabled(
+    nix: &Path,
+    installable: &str,
+    attribute: &str,
+    enabled_attribute: Option<&str>,
+    impure: bool,
+) -> Result<bool, String> {
+    if let Some(enabled) = enabled_attribute {
+        return eval_bool(nix, &format!("{installable}.config.{enabled}"), None, impure);
+    }
+    let (parent, apply) = presence_probe(attribute)?;
+    eval_bool(
+        nix,
+        &format!("{installable}.config{parent}"),
+        Some(&apply),
+        impure,
+    )
+}
 pub fn deploy(args: &[String]) -> Result<(), String> {
     let mut installable = None;
     let mut nix = PathBuf::from("nix");
@@ -75,6 +146,8 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     let mut signer_relative = "bin/update-artifact-sign".to_owned();
     let mut network_attribute = None;
     let mut network_enabled_attribute = None;
+    let mut tools_attribute = None;
+    let mut tools_enabled_attribute = None;
     let mut reboot = false;
     let mut external_signing = false;
     let mut iter = args.iter();
@@ -92,6 +165,8 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
             }
             "--network-attribute" => network_attribute = iter.next().cloned(),
             "--network-enabled-attribute" => network_enabled_attribute = iter.next().cloned(),
+            "--tools-attribute" => tools_attribute = iter.next().cloned(),
+            "--tools-enabled-attribute" => tools_enabled_attribute = iter.next().cloned(),
             "--installable" => installable = iter.next().cloned(),
             "--nix" => {
                 nix = iter
@@ -181,47 +256,42 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
         pass.push("--wait-system".into());
         pass.push(toplevel.to_string_lossy().into_owned());
     }
-    if let Some(attribute) = network_attribute {
-        let enabled = if let Some(enabled_attribute) = network_enabled_attribute {
-            let mut command = Command::new(&nix);
-            command.args([
-                "--extra-experimental-features",
-                "nix-command flakes",
-                "eval",
-                "--json",
-            ]);
-            if impure {
-                command.arg("--impure");
-            }
-            let output = command
-                .arg(format!("{installable}.config.{enabled_attribute}"))
-                .managed_output()
-                .map_err(|e| e.to_string())?;
-            if !output.status.success() {
-                return Err("evaluating optional artifact failed".into());
-            }
-            match std::str::from_utf8(&output.stdout)
-                .map_err(|e| e.to_string())?
-                .trim()
-            {
-                "true" => true,
-                "false" => false,
-                _ => return Err("optional artifact predicate must be boolean".into()),
-            }
-        } else {
-            true
-        };
-        if enabled {
-            let path = build(
-                &nix,
-                &installable,
-                &attribute,
-                &roots.0.join("network"),
-                impure,
-            )?;
-            pass.push("--network".into());
+    for (option, name, attribute, enabled_attribute) in [
+        ("--network", "network", network_attribute, network_enabled_attribute),
+        ("--tools", "tools", tools_attribute, tools_enabled_attribute),
+    ] {
+        let Some(attribute) = attribute else { continue };
+        if optional_enabled(
+            &nix,
+            &installable,
+            &attribute,
+            enabled_attribute.as_deref(),
+            impure,
+        )? {
+            let path = build(&nix, &installable, &attribute, &roots.0.join(name), impure)?;
+            pass.push(option.into());
             pass.push(path.to_string_lossy().into_owned());
         }
     }
     crate::artifact_client::deploy(&pass)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presence_probe_quotes_only_plain_leaf_names() {
+        assert_eq!(
+            presence_probe("system.build.nmblRescueTools").unwrap(),
+            (".system.build".into(), "v: v ? \"nmblRescueTools\"".into())
+        );
+        assert_eq!(
+            presence_probe("toplevel").unwrap(),
+            (String::new(), "v: v ? \"toplevel\"".into())
+        );
+        for bad in ["", "system.build.", ".x", "a.b\"c", "a.${x}", "a.b c"] {
+            assert!(presence_probe(bad).is_err(), "{bad}");
+        }
+    }
 }

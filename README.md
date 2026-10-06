@@ -75,7 +75,11 @@ public-key file and the immutable signature verifier. The account has no shell
 and no sudo permission. Rust code handles artifact headers, payload lengths,
 content hashes, sidecars, staging and atomic selection. The service verifies
 the signatures of the kernel, initrd, configuration, rescue and optional
-network payloads before it selects a generation. A new attempt may replace an
+network and rescue tools payloads before it selects a generation. Uploads use
+NMBL's `NMBL-EROFS-BUNDLE-4` format; the service refuses the older
+`NMBL-EROFS-BUNDLE-3`, and refuses a configuration that pins a rescue tools
+image (`[rescue.tools]`) without it, or an image the configuration does not
+pin. A new attempt may replace an
 unhealthy unconfirmed attempt, and the last tested fallback stays in place.
 Only the boot health check can mark a generation as tested.
 
@@ -92,7 +96,10 @@ with `--image-attribute`, `--config-attribute`, `--rescue-attribute`,
 `--signer-attribute` and `--system-attribute`. The generic workflow defaults to
 `system.build.updateArtifacts.*` and does not depend on any NMBL attribute.
 `--signer-relative-path` gives the location of the signer executable. Optional
-network artifacts use `--network-attribute` and `--network-enabled-attribute`.
+network artifacts use `--network-attribute` and `--network-enabled-attribute`,
+and an optional rescue tools image uses `--tools-attribute` and
+`--tools-enabled-attribute`. Without the predicate, an optional artifact is
+built when the configuration defines its attribute.
 
 The command builds those public outputs and registers GC roots in a
 `system-update-roots-*` directory in the current checkout, and prints that

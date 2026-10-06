@@ -159,18 +159,44 @@ fn lock(root: &Path) -> Result<File, String> {
     rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).map_err(error)?;
     Ok(file)
 }
-fn prepare_impl(args: &[String]) -> Result<(String, bool), String> {
-    let options = options(args)?;
-    let mut input = io::stdin().lock();
-    let mut fields = Vec::new();
-    for _ in 0..17 {
-        fields.push(protocol::read_control_line(&mut input)?);
-    }
-    if fields[0] != "NMBL-EROFS-BUNDLE-3" || !valid_id(&fields[1]) || !valid_id(&fields[5]) {
+/// The signed bundle protocol shared with NMBL's `nmbl-erofs-receive`.
+pub(crate) const BUNDLE_MAGIC: &str = "NMBL-EROFS-BUNDLE-4";
+/// Payload names in protocol order, one per size line of the header.
+pub(crate) const PAYLOADS: [&str; 15] = [
+    "nix.erofs",
+    "nix.erofs.sig",
+    "system",
+    "config.toml",
+    "config.toml.sig",
+    "kernel",
+    "kernel.sig",
+    "initrd",
+    "initrd.sig",
+    "rescue.sfs",
+    "rescue.sfs.sig",
+    "network.erofs",
+    "network.erofs.sig",
+    "rescue-tools.erofs",
+    "rescue-tools.erofs.sig",
+];
+/// The config table that pins a rescue tools image.
+const TOOLS_PIN: &str = "[rescue.tools]";
+#[derive(Debug)]
+struct Header {
+    id: String,
+    config_id: String,
+    sizes: Vec<u64>,
+    reboot: bool,
+}
+/// Parses the header lines after the magic: generation id, the image,
+/// signature and system sizes, config id, the remaining payload sizes in
+/// `PAYLOADS` order, and the reboot flag.
+fn parse_header(fields: &[String]) -> Result<Header, String> {
+    if fields.len() != 18 || !valid_id(&fields[0]) || !valid_id(&fields[4]) {
         return Err("invalid signed artifact header".into());
     }
     let mut sizes = Vec::new();
-    for index in [2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
+    for index in (1..=3).chain(5..=16) {
         let value = &fields[index];
         if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
             return Err("invalid artifact size".into());
@@ -181,7 +207,6 @@ fn prepare_impl(args: &[String]) -> Result<(String, bool), String> {
         }
         sizes.push(size);
     }
-
     for index in [0, 1, 3, 4, 5, 6, 7, 8, 9, 10] {
         if sizes[index] == 0 {
             return Err("empty artifact or signature".into());
@@ -190,36 +215,61 @@ fn prepare_impl(args: &[String]) -> Result<(String, bool), String> {
     if (sizes[11] == 0) != (sizes[12] == 0) {
         return Err("incomplete network artifact".into());
     }
-    let reboot = match fields[16].as_str() {
+    if (sizes[13] == 0) != (sizes[14] == 0) {
+        return Err("incomplete rescue tools artifact".into());
+    }
+    let reboot = match fields[17].as_str() {
         "0" => false,
         "1" => true,
         _ => return Err("invalid reboot flag".into()),
     };
     // Small signed metadata must never cause an unbounded allocation or disk fill.
-    for index in [1, 2, 3, 4, 6, 8, 10, 12] {
+    for index in [1, 2, 3, 4, 6, 8, 10, 12, 14] {
         if sizes[index] > 16 * 1024 * 1024 {
             return Err("artifact metadata exceeds size limit".into());
         }
     }
+    Ok(Header {
+        id: fields[0].clone(),
+        config_id: fields[4].clone(),
+        sizes,
+        reboot,
+    })
+}
+/// A config that pins a rescue tools image must arrive with it, and only then.
+fn tools_pin_matches(config: &[u8], has_tools: bool) -> Result<(), String> {
+    let pinned = config
+        .split(|b| *b == b'\n')
+        .any(|line| line == TOOLS_PIN.as_bytes());
+    match (pinned, has_tools) {
+        (true, false) => Err("config pins a rescue tools image the bundle lacks".into()),
+        (false, true) => Err("bundle carries a rescue tools image its config does not pin".into()),
+        _ => Ok(()),
+    }
+}
+fn prepare_impl(args: &[String]) -> Result<(String, bool), String> {
+    let options = options(args)?;
+    let mut input = io::stdin().lock();
+    let magic = protocol::read_control_line(&mut input)?;
+    if magic == "NMBL-EROFS-BUNDLE-3" {
+        return Err(
+            "sender speaks NMBL-EROFS-BUNDLE-3; NMBL-EROFS-BUNDLE-4 adds the rescue tools image"
+                .into(),
+        );
+    }
+    if magic != BUNDLE_MAGIC {
+        return Err("invalid signed artifact header".into());
+    }
+    let mut fields = Vec::new();
+    for _ in 0..18 {
+        fields.push(protocol::read_control_line(&mut input)?);
+    }
+    let header = parse_header(&fields)?;
+    let sizes = &header.sizes;
     let generations = options.root.join("generations");
     ensure_private_dir(&generations)?;
     let temporary = temporary(&generations)?;
-    let names = [
-        "nix.erofs",
-        "nix.erofs.sig",
-        "system",
-        "config.toml",
-        "config.toml.sig",
-        "kernel",
-        "kernel.sig",
-        "initrd",
-        "initrd.sig",
-        "rescue.sfs",
-        "rescue.sfs.sig",
-        "network.erofs",
-        "network.erofs.sig",
-    ];
-    for (name, size) in names.iter().zip(&sizes) {
+    for (name, size) in PAYLOADS.iter().zip(sizes) {
         if *size > 0 {
             receive(&mut input, *size, &temporary.0.join(name))?;
         }
@@ -228,11 +278,15 @@ fn prepare_impl(args: &[String]) -> Result<(String, bool), String> {
     if input.read(&mut extra).map_err(error)? != 0 {
         return Err("trailing artifact protocol data".into());
     }
-    if hash(&options, &temporary.0.join("nix.erofs"))? != fields[1]
-        || hash(&options, &temporary.0.join("config.toml"))? != fields[5]
+    if hash(&options, &temporary.0.join("nix.erofs"))? != header.id
+        || hash(&options, &temporary.0.join("config.toml"))? != header.config_id
     {
         return Err("artifact content hash mismatch".into());
     }
+    tools_pin_matches(
+        &fs::read(temporary.0.join("config.toml")).map_err(error)?,
+        sizes[13] > 0,
+    )?;
     for (name, domain) in [
         ("nix.erofs", "generation-image"),
         ("config.toml", "boot-config"),
@@ -244,6 +298,9 @@ fn prepare_impl(args: &[String]) -> Result<(String, bool), String> {
     }
     if sizes[11] > 0 {
         signature(&options, &temporary.0, "network.erofs", "network-stage")?;
+    }
+    if sizes[13] > 0 {
+        signature(&options, &temporary.0, "rescue-tools.erofs", "rescue-tools")?;
     }
     if let Some(tools) = &options.bootstrap_tools {
         verify::checked(
@@ -266,7 +323,7 @@ fn prepare_impl(args: &[String]) -> Result<(String, bool), String> {
     if sizes[2] > 0 {
         fs::remove_file(temporary.0.join("system")).map_err(error)?;
     }
-    fs::write(temporary.0.join("generation"), format!("{}\n", fields[1])).map_err(error)?;
+    fs::write(temporary.0.join("generation"), format!("{}\n", header.id)).map_err(error)?;
     for entry in fs::read_dir(&temporary.0).map_err(error)? {
         let entry = entry.map_err(error)?;
         fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o444)).map_err(error)?;
@@ -280,7 +337,7 @@ fn prepare_impl(args: &[String]) -> Result<(String, bool), String> {
         .sync_all()
         .map_err(error)?;
     let _guard = lock(&options.root)?;
-    let destination = generations.join(&fields[1]);
+    let destination = generations.join(&header.id);
     if destination.exists() {
         let metadata = fs::symlink_metadata(&destination).map_err(error)?;
         if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
@@ -293,7 +350,8 @@ fn prepare_impl(args: &[String]) -> Result<(String, bool), String> {
             // verifies the retained signatures before selecting this directory.
             if matches!(entry.file_name().to_str(), Some(
                 "nix.erofs.sig" | "config.toml.sig" | "kernel.sig" |
-                "initrd.sig" | "rescue.sfs.sig" | "network.erofs.sig"
+                "initrd.sig" | "rescue.sfs.sig" | "network.erofs.sig" |
+                "rescue-tools.erofs.sig"
             )) {
                 continue;
             }
@@ -308,7 +366,7 @@ fn prepare_impl(args: &[String]) -> Result<(String, bool), String> {
             .sync_all()
             .map_err(error)?;
     }
-    Ok((fields[1].clone(), reboot))
+    Ok((header.id, header.reboot))
 }
 fn selected(root: &Path, name: &str) -> Result<Option<String>, String> {
     let target = match fs::read_link(root.join(name)) {
@@ -364,6 +422,9 @@ pub fn activate(args: &[String]) -> Result<(), String> {
     }
     if dir.join("network.erofs").exists() {
         signature(&options, &dir, "network.erofs", "network-stage")?;
+    }
+    if dir.join("rescue-tools.erofs").exists() {
+        signature(&options, &dir, "rescue-tools.erofs", "rescue-tools")?;
     }
     if options.bootstrap_tools.is_some() {
         for name in ["bootstrap-kernel", "bootstrap-initrd"] {
@@ -508,4 +569,79 @@ pub fn install(args: &[String]) -> Result<(), String> {
     result?;
     println!("OK {id}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fields(sizes: [u64; 15], reboot: &str) -> Vec<String> {
+        let mut fields = vec!["a".repeat(128)];
+        fields.extend(sizes[..3].iter().map(u64::to_string));
+        fields.push("b".repeat(128));
+        fields.extend(sizes[3..].iter().map(u64::to_string));
+        fields.push(reboot.into());
+        fields
+    }
+    const BASE: [u64; 15] = [9, 2, 0, 3, 2, 4, 2, 5, 2, 6, 2, 0, 0, 0, 0];
+
+    #[test]
+    fn header_maps_sizes_to_payload_order() {
+        let mut sizes = BASE;
+        sizes[11..].copy_from_slice(&[7, 2, 8, 2]);
+        let header = parse_header(&fields(sizes, "1")).unwrap();
+        assert_eq!(header.sizes, sizes);
+        assert_eq!(header.id, "a".repeat(128));
+        assert_eq!(header.config_id, "b".repeat(128));
+        assert!(header.reboot);
+        assert_eq!(PAYLOADS[13], "rescue-tools.erofs");
+        assert!(!parse_header(&fields(BASE, "0")).unwrap().reboot);
+    }
+
+    #[test]
+    fn header_refuses_partial_optional_payloads_and_bad_shapes() {
+        for (index, value) in [(11, 7), (12, 2), (13, 8), (14, 2)] {
+            let mut sizes = BASE;
+            sizes[index] = value;
+            assert!(parse_header(&fields(sizes, "0")).unwrap_err().contains("incomplete"));
+        }
+        let mut sizes = BASE;
+        sizes[14] = 17 * 1024 * 1024;
+        sizes[13] = 1;
+        assert!(parse_header(&fields(sizes, "0")).unwrap_err().contains("metadata"));
+        let mut sizes = BASE;
+        sizes[9] = 0;
+        assert!(parse_header(&fields(sizes, "0")).unwrap_err().contains("empty"));
+        assert!(parse_header(&fields(BASE, "2")).is_err());
+        // A BUNDLE-3 shaped header (two size lines short) never parses.
+        let mut short = fields(BASE, "0");
+        short.drain(15..17);
+        assert!(parse_header(&short).is_err());
+    }
+
+    #[test]
+    fn client_header_parses_on_the_receiver() {
+        let lines: Vec<String> = crate::artifact_client::bundle_header(
+            &"a".repeat(128),
+            &"b".repeat(128),
+            &[9, 2, 3, 2, 4, 2, 5, 2, 6, 2, 7, 2, 8, 2],
+            false,
+        )
+        .lines()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(lines[0], BUNDLE_MAGIC);
+        let header = parse_header(&lines[1..]).unwrap();
+        assert_eq!(header.sizes, [9, 2, 0, 3, 2, 4, 2, 5, 2, 6, 2, 7, 2, 8, 2]);
+    }
+
+    #[test]
+    fn tools_image_travels_exactly_with_its_pin() {
+        let pinned = b"[rescue]\nmode = \"external\"\n\n[rescue.tools]\npath = \"x\"\n";
+        let unpinned = b"[rescue]\nmode = \"external\"\n# [rescue.tools]\n";
+        assert!(tools_pin_matches(pinned, true).is_ok());
+        assert!(tools_pin_matches(unpinned, false).is_ok());
+        assert!(tools_pin_matches(pinned, false).unwrap_err().contains("lacks"));
+        assert!(tools_pin_matches(unpinned, true).unwrap_err().contains("does not pin"));
+    }
 }
