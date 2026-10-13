@@ -14,6 +14,10 @@ struct Plan {
     session_environment: String,
     session_command: Vec<String>,
     authentication_command: Vec<String>,
+    /// Obtains the operator's approval of the logins before each connection;
+    /// see `--login-approval-command`. Empty: none.
+    #[serde(default)]
+    login_approval_command: Vec<String>,
     ssh_arguments: Vec<String>,
     copy_ssh_arguments: Vec<String>,
     reboot: bool,
@@ -100,6 +104,11 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     }
     let mut child = Command::new(command);
     child.args(arguments).arg(&executable).arg(&plan.backend).args(expanded(&plan.arguments, &replacements));
+    let approval = expanded(&plan.login_approval_command, &replacements);
+    if let Some((program, arguments)) = approval.split_first() {
+        child.arg("--login-approval-command").arg(program);
+        for argument in arguments { child.arg("--login-approval-arg").arg(argument); }
+    }
     for argument in ssh_arguments { child.arg("--ssh-arg").arg(argument); }
     if plan.reboot && !no_reboot { child.arg("--reboot"); }
     child.env("NIX_SSHOPTS", copy_arguments.iter().map(|v| quote(v)).collect::<Vec<_>>().join(" "));

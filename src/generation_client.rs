@@ -186,7 +186,8 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
             }
             "--sign-arg" | "--target" | "--signing-key" | "--key-command" | "--key-arg" | "--ssh-command"
             | "--ssh-arg" | "--sha512sum" | "--post-command" | "--post-arg"
-            | "--remote-command" | "--remote-arg" => {
+            | "--remote-command" | "--remote-arg" | "--login-approval-command"
+            | "--login-approval-arg" => {
                 pass.push(arg.clone());
                 pass.push(
                     iter.next()

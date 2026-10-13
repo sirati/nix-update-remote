@@ -21,6 +21,7 @@ struct Options {
     post_command: Option<PathBuf>,
     post_args: Vec<String>,
     ssh_args: Vec<String>,
+    login_approval: crate::login_approval::LoginApproval,
 }
 
 pub fn deploy(args: &[String]) -> Result<(), String> {
@@ -69,6 +70,8 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
             }
         }
     }
+    // The one login of this update is approved before it connects.
+    options.login_approval.before_connecting()?;
     let transport = Transport::connect(&options)?;
     let store = format!("{}?max-connections=1", store_uri(&options.target)?);
     copy_closure(&system, &store, &transport)?;
@@ -162,8 +165,12 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut post_command = None;
     let mut post_args = Vec::new();
     let mut ssh_args = Vec::new();
+    let mut login_approval = crate::login_approval::LoginApproval::default();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
+        if login_approval.parse(arg, &mut iter)? {
+            continue;
+        }
         match arg.as_str() {
             "--target" => target = iter.next().cloned(),
             "--installable" => installable = iter.next().cloned(),
@@ -197,6 +204,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
             _ => return Err(format!("unknown deploy argument: {arg}")),
         }
     }
+    login_approval.validate()?;
     if !activation_args.is_empty() && activation_command.is_none() {
         return Err("activation arguments require --activation-command".into());
     }
@@ -235,6 +243,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         post_command,
         post_args,
         ssh_args,
+        login_approval,
     })
 }
 

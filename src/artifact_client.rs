@@ -129,8 +129,12 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     let mut post_command = None;
     let mut post_args = Vec::new();
     let mut wait_system = None;
+    let mut login_approval = crate::login_approval::LoginApproval::default();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
+        if login_approval.parse(arg, &mut iter)? {
+            continue;
+        }
         match arg.as_str() {
             "--remote-command" => remote_command = iter.next().cloned(),
             "--remote-arg" => {
@@ -160,6 +164,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
             _ => return Err(format!("unknown artifact deploy argument: {arg}")),
         }
     }
+    login_approval.validate()?;
     if post_command.is_some() && reboot && wait_system.is_none() {
         return Err(
             "post-update operation requires the expected --wait-system after reboot".into(),
@@ -301,6 +306,8 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
         }
         "nmbl-erofs-receive".to_owned()
     };
+    // The upload logs in only once the operator approved it.
+    login_approval.before_connecting()?;
     let mut ssh = Command::new(&ssh_command)
         .args(&ssh_args)
         .args(["--", &target, &remote])
@@ -332,8 +339,11 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
         return Err("signed artifact update failed".into());
     }
     if let Some(expected) = wait_system {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        // Five minutes of waiting for the host, not for the operator: the
+        // time an approval takes extends the deadline.
+        let mut deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
         loop {
+            deadline += login_approval.before_connecting()?;
             let output = Command::new(&ssh_command)
                 .args(&ssh_args)
                 .args(["--", &target, "current-system"])

@@ -121,6 +121,16 @@ repeated `--ssh-arg` options plugs in an operator authentication provider.
 The operator controls these providers, and they stay on the operator side of
 the target's privilege boundary.
 
+An authentication provider that asks a person for each login would keep the
+connection waiting while sshd counts its `LoginGraceTime`. With
+`--login-approval-command PROGRAM` and repeated `--login-approval-arg ARG`,
+`deploy`, `deploy-artifact` and `deploy-generation` run that provider before
+every SSH connection that needs a signature, including each poll after a
+reboot. The provider exits zero once the operator approved the logins, and
+returns at once while an earlier approval still covers them. The reboot
+poll's five minutes do not count the time it waits. A configured plan names
+it in `loginApprovalCommand`.
+
 ## Durable notifications
 
 The service writes events to the root-owned `reportQueue`

@@ -284,8 +284,14 @@ in
     # key: copying content alone cannot satisfy recursive verification.
     machine.succeed("echo " + shlex.quote(client_public) + " > /run/nix-update-remote/trusted-public-keys; chown root:update /run/nix-update-remote/trusted-public-keys; chmod 0440 /run/nix-update-remote/trusted-public-keys")
     client.succeed("mkdir -p /root/.ssh; echo 'Host machine\n IdentityFile /root/.ssh/update-b\n IdentitiesOnly yes\n StrictHostKeyChecking no\n UserKnownHostsFile /dev/null\n BatchMode yes' > /root/.ssh/config")
-    output = client.succeed(f"cd /root && NIX_SSHOPTS='{nix_ssh_b}' ${updater}/bin/nix-update-remote deploy --ssh-arg -o --ssh-arg BatchMode=yes --target update@machine --installable {second} --key-command ${pkgs.coreutils}/bin/cat --key-arg /root/client-update-key --post-command ${pkgs.findutils}/bin/find --post-arg /root --post-arg -maxdepth --post-arg 1 --post-arg -name --post-arg 'system-update-roots-*' --post-arg -exec --post-arg ${pkgs.coreutils}/bin/test --post-arg -L --post-arg '{{}}/system' --post-arg ';' --post-arg -print")
+    # The login is approved before the update connects: a refused approval
+    # leaves the target untouched, without even a login.
+    logins_before = machine.succeed("journalctl -u sshd.service --no-pager -o cat").count("Accepted publickey for update ")
+    client.fail(f"cd /root && NIX_SSHOPTS='{nix_ssh_b}' ${updater}/bin/nix-update-remote deploy --ssh-arg -o --ssh-arg BatchMode=yes --target update@machine --installable {second} --key-command ${pkgs.coreutils}/bin/cat --key-arg /root/client-update-key --login-approval-command ${pkgs.coreutils}/bin/false")
+    assert machine.succeed("journalctl -u sshd.service --no-pager -o cat").count("Accepted publickey for update ") == logins_before
+    output = client.succeed(f"cd /root && NIX_SSHOPTS='{nix_ssh_b}' ${updater}/bin/nix-update-remote deploy --ssh-arg -o --ssh-arg BatchMode=yes --target update@machine --installable {second} --key-command ${pkgs.coreutils}/bin/cat --key-arg /root/client-update-key --login-approval-command ${pkgs.coreutils}/bin/touch --login-approval-arg /root/login-approved --post-command ${pkgs.findutils}/bin/find --post-arg /root --post-arg -maxdepth --post-arg 1 --post-arg -name --post-arg 'system-update-roots-*' --post-arg -exec --post-arg ${pkgs.coreutils}/bin/test --post-arg -L --post-arg '{{}}/system' --post-arg ';' --post-arg -print")
     assert "/root/system-update-roots-" in output, output
+    client.succeed("test -e /root/login-approved")
     client.succeed("test -z \"$(find /root -maxdepth 1 -name 'system-update-roots-*')\"")
 
     # A service waits for a deployment prerequisite. The real client must

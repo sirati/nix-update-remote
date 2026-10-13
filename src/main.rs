@@ -9,6 +9,7 @@ mod client;
 mod closure_signing;
 mod configured_client;
 mod keygen;
+mod login_approval;
 mod daemon;
 mod generation_client;
 mod protocol;
