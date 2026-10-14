@@ -141,6 +141,17 @@ in
         message = "remoteUpdate hooks must be absolute Nix store executables.";
       }
       {
+        # The broker runs `switch-to-configuration boot` for commits and
+        # rollbacks; a sandbox that remounts /boot read-only breaks both.
+        assertion =
+          let service = config.systemd.services.nix-update-remote.serviceConfig; in
+          !(builtins.elem (service.ProtectSystem or false) [ true "yes" "full" "strict" ])
+          && !(service.PrivateMounts or false)
+          && (service.ReadOnlyPaths or [ ]) == [ ]
+          && (service.InaccessiblePaths or [ ]) == [ ];
+        message = "nix-update-remote.service must keep /boot writable: no ProtectSystem, PrivateMounts, ReadOnlyPaths or InaccessiblePaths.";
+      }
+      {
         assertion = cfg.hookUid > 0 && cfg.hookGid > 0;
         message = "remoteUpdate hooks must run with non-root UID and GID.";
       }

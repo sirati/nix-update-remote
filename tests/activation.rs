@@ -13,6 +13,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gate = std::env::args().nth(2).ok_or("missing gate path")?;
             gate.as_str()
         }
+        // The warning reporter: one line per report.
+        "warn" => {
+            use std::io::Write;
+            let message = std::env::args().skip(2).collect::<Vec<_>>().join(" ");
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/root/warning-reports")?;
+            writeln!(file, "{message}")?;
+            return Ok(());
+        }
         // The failure reporter: one line per report.
         "report" => {
             use std::io::Write;

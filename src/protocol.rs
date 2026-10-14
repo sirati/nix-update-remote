@@ -140,6 +140,8 @@ pub enum SwitchLine {
     Activated(PathBuf),
     Failed(String),
     Waiting,
+    /// Committed, but the operator must see this.
+    Warning(String),
     Ok(PathBuf),
     /// Nothing changed on the host. Legacy brokers give no reason.
     Rejected(String),
@@ -154,6 +156,7 @@ impl SwitchLine {
             "ACTIVATED" => SwitchLine::Activated(PathBuf::from(rest)),
             "FAILED" => SwitchLine::Failed(rest.to_owned()),
             "WAITING" => SwitchLine::Waiting,
+            "WARNING" => SwitchLine::Warning(rest.to_owned()),
             "OK" => SwitchLine::Ok(PathBuf::from(rest)),
             "REJECTED" => SwitchLine::Rejected(rest.to_owned()),
             "ROLLED-BACK" => SwitchLine::RolledBack(rest.to_owned()),
@@ -164,7 +167,10 @@ impl SwitchLine {
     }
 
     pub fn is_final(&self) -> bool {
-        !matches!(self, SwitchLine::Activated(_) | SwitchLine::Failed(_) | SwitchLine::Waiting)
+        !matches!(
+            self,
+            SwitchLine::Activated(_) | SwitchLine::Failed(_) | SwitchLine::Waiting | SwitchLine::Warning(_)
+        )
     }
 
     /// What the operator is told about a final line other than `OK`.
@@ -196,6 +202,8 @@ mod switch_line_tests {
         assert!(SwitchLine::parse("ROLLED-BACK x").unwrap().failure().unwrap().contains("rolled back: x"));
         assert!(SwitchLine::parse("REJECTED x").unwrap().failure().unwrap().contains("unchanged"));
         assert!(!SwitchLine::parse("FAILED x").unwrap().is_final());
+        assert_eq!(SwitchLine::parse("WARNING a.service").unwrap(), SwitchLine::Warning("a.service".into()));
+        assert!(!SwitchLine::parse("WARNING a").unwrap().is_final());
         assert!(SwitchLine::parse("SOMETHING").is_err());
         assert_eq!(one_line("a\nb\x1b"), "a b ");
         assert_eq!(one_line(&"é".repeat(MAX_REASON)).len(), MAX_REASON);

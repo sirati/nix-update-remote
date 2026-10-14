@@ -36,6 +36,8 @@ pub struct FakeHost {
     pub journal: Option<Journal>,
     pub boot_id: String,
     pub journal_write_fails: bool,
+    /// Systems whose `test` exits before it activates anything.
+    pub never_activates: BTreeSet<PathBuf>,
     pub log: Vec<String>,
 }
 
@@ -140,6 +142,9 @@ impl Host for FakeHost {
         let definition = self.systems[system].clone();
         match action {
             Action::Test => {
+                if self.never_activates.contains(system) {
+                    return Ok(Some(definition.test_exit));
+                }
                 self.activate(system);
                 if watch.is_some() {
                     events.activated(system);
@@ -254,4 +259,7 @@ impl Events for Recorder {
         self.0.push(format!("FAILED {reason}"));
     }
     fn waiting(&mut self, _: &str) {}
+    fn warning(&mut self, text: &str) {
+        self.0.push(format!("WARNING {text}"));
+    }
 }

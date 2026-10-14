@@ -206,8 +206,11 @@ restored:
 2. A unit of the new system that fails and stays failed ends the switch at once,
    even while other units still wait. Afterwards the health gate gives units a
    few seconds to fail (`health.settleSeconds`), starts `health.units` and checks
-   that sshd listens on `health.sshPorts`. Units that already failed before the
-   update do not count.
+   that sshd listens on `health.sshPorts`. A non-zero exit of the switch is not
+   a failure by itself. The gate rolls back on units that failed since the
+   update began and still belong to the system, a failed health unit, a missing
+   sshd, a new system that never became current, or a killed switch. Units that
+   were already failed before the update are reported as warnings.
 3. Only then does the broker set the profile and run
    `switch-to-configuration boot`.
 4. Any failure on the way rolls back. The broker restores the profile link and,
@@ -217,8 +220,8 @@ restored:
 5. A broker that restarts with a journal from the same boot rolls back the switch
    it interrupted.
 
-The client receives `ACTIVATED`, `WAITING` (keepalive) and `FAILED <reason>`
-progress lines, then one verdict:
+The client receives `ACTIVATED`, `WAITING` (keepalive), `WARNING <text>` and
+`FAILED <reason>` progress lines, then one verdict:
 
 - `OK`.
 - `REJECTED <reason>`: the host is unchanged.
@@ -228,7 +231,9 @@ progress lines, then one verdict:
 A client that disconnects does not stop the switch or its rollback. With
 `--failure-command PROGRAM` and repeated `--failure-arg ARG`, the client reports
 every failure as soon as it is known, with the reason as the last argument. A
-configured plan sets this with `failureCommand`.
+configured plan sets this with `failureCommand`. Warnings of an update that
+committed go to `--warning-command` with repeated `--warning-arg` (plan:
+`warningCommand`) in the same way.
 
 An integration may supply `--post-command PROGRAM` with repeated `--post-arg ARG`
 for operator work after an update. With `--reboot`, the generation workflow waits

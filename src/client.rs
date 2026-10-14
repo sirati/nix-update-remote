@@ -25,6 +25,8 @@ struct Options {
     login_approval: crate::login_approval::LoginApproval,
     failure_command: Option<PathBuf>,
     failure_args: Vec<String>,
+    warning_command: Option<PathBuf>,
+    warning_args: Vec<String>,
 }
 
 pub fn deploy(args: &[String]) -> Result<(), String> {
@@ -179,6 +181,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut ssh_args = Vec::new();
     let mut failure_command = None;
     let mut failure_args = Vec::new();
+    let mut warning_command = None;
+    let mut warning_args = Vec::new();
     let mut login_approval = crate::login_approval::LoginApproval::default();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -223,12 +227,23 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--failure-arg" => {
                 failure_args.push(iter.next().ok_or("missing failure argument")?.clone())
             }
+            "--warning-command" => {
+                warning_command = Some(PathBuf::from(
+                    iter.next().ok_or("missing warning command")?,
+                ))
+            }
+            "--warning-arg" => {
+                warning_args.push(iter.next().ok_or("missing warning argument")?.clone())
+            }
             _ => return Err(format!("unknown deploy argument: {arg}")),
         }
     }
     login_approval.validate()?;
     if !activation_args.is_empty() && activation_command.is_none() {
         return Err("activation arguments require --activation-command".into());
+    }
+    if !warning_args.is_empty() && warning_command.is_none() {
+        return Err("warning arguments require --warning-command".into());
     }
     if !failure_args.is_empty() && failure_command.is_none() {
         return Err("failure arguments require --failure-command".into());
@@ -271,6 +286,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         login_approval,
         failure_command,
         failure_args,
+        warning_command,
+        warning_args,
     })
 }
 
@@ -371,6 +388,7 @@ fn apply(options: &Options, system: &Path, transport: &Transport) -> Result<(), 
         system,
         &mut || activation_callback(options),
         &mut |message| report_failure(options, message),
+        &mut |message| report_warning(options, message),
         SILENCE_LIMIT,
     )?;
     let status = child.0.wait().map_err(|error| error.to_string())?;
@@ -432,9 +450,11 @@ fn follow(
     system: &Path,
     start: &mut dyn FnMut() -> Result<Option<Box<dyn Running>>, String>,
     report: &mut dyn FnMut(&str),
+    warn: &mut dyn FnMut(&str),
     silence_limit: Duration,
 ) -> Result<(), String> {
     use protocol::SwitchLine;
+    let mut warnings: Vec<String> = Vec::new();
     let mut activated = false;
     let mut failed = false;
     let mut running: Option<Box<dyn Running>> = None;
@@ -489,6 +509,10 @@ fn follow(
                 report(&format!("activation failed, the host is rolling back: {reason}"));
             }
             SwitchLine::Waiting => {}
+            SwitchLine::Warning(text) => {
+                eprintln!("nix-update-remote: warning: {text}");
+                warnings.push(text);
+            }
             SwitchLine::Ok(path) if path == system && !failed => {
                 if !activated {
                     // Legacy brokers emit only the final receipt.
@@ -502,6 +526,9 @@ fn follow(
                     } else {
                         std::thread::sleep(Duration::from_millis(100));
                     }
+                }
+                if !warnings.is_empty() {
+                    warn(&format!("updated with warnings: {}", warnings.join("; ")));
                 }
                 return callback.unwrap_or_else(callback_failed);
             }
@@ -628,6 +655,14 @@ fn activation_callback(options: &Options) -> Result<Option<Box<dyn Running>>, St
     Ok(Some(Box::new(CallbackChild(child))))
 }
 
+/// Tells the operator what an update that succeeded left broken.
+fn report_warning(options: &Options, message: &str) {
+    eprintln!("nix-update-remote: {message}");
+    if let Some(command) = &options.warning_command {
+        report_with(command, &options.warning_args, message);
+    }
+}
+
 /// Tells the operator about a failure as soon as it is known, through the
 /// configured reporter (such as a procedure step in the operator's TUI).
 /// Reporting never changes the outcome.
@@ -734,6 +769,7 @@ mod tests {
                 start()
             },
             &mut |_| panic!("nothing failed"),
+            &mut |_| panic!("no warning"),
             SILENCE_LIMIT,
         );
         assert_eq!(result, Ok(()));
@@ -796,15 +832,35 @@ mod tests {
 
     fn drive(lines: &[&str], end: bool, outcome: Option<bool>) -> (Result<(), String>, Probe, Vec<String>) {
         let probe = Probe::default();
-        let mut reports = Vec::new();
+        let reports = std::cell::RefCell::new(Vec::new());
         let result = follow(
             &feed(lines, end),
             Path::new("/nix/store/test-system"),
             &mut probe.starter(outcome),
-            &mut |message| reports.push(message.to_owned()),
+            &mut |message| reports.borrow_mut().push(message.to_owned()),
+            &mut |message| reports.borrow_mut().push(format!("WARN {message}")),
             Duration::from_millis(300),
         );
-        (result, probe, reports)
+        (result, probe, reports.into_inner())
+    }
+
+    #[test]
+    fn pre_existing_failures_commit_and_reach_the_operator_as_warnings() {
+        let (result, probe, reports) = drive(
+            &[
+                "ACTIVATED /nix/store/test-system",
+                "WARNING switch-to-configuration test exited with status 4",
+                "WARNING old.service was already failed before the update and still is",
+                "OK /nix/store/test-system",
+            ],
+            false,
+            Some(true),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(probe.started.load(Ordering::SeqCst), 1, "the secret step runs after a warning");
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert!(reports[0].starts_with("WARN updated with warnings: "), "{reports:?}");
+        assert!(reports[0].contains("old.service was already failed"), "{reports:?}");
     }
 
     #[test]
@@ -817,6 +873,7 @@ mod tests {
                 &lines,
                 Path::new("/nix/store/test-system"),
                 &mut watched.starter(None),
+                &mut |_| {},
                 &mut |_| {},
                 SILENCE_LIMIT,
             )
@@ -920,6 +977,7 @@ mod tests {
             &lines,
             Path::new("/nix/store/test-system"),
             &mut probe.delayed(Some(true), Duration::from_millis(600)),
+            &mut |_| {},
             &mut |_| {},
             Duration::from_millis(300),
         );

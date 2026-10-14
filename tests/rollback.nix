@@ -43,12 +43,30 @@ in
         health.settleSeconds = 3;
       };
       services.openssh.enable = true;
+      # /boot as on ns1: a separate vfat partition with the same options.
+      virtualisation.emptyDiskImages = [ 64 ];
+      virtualisation.fileSystems."/boot" = {
+        device = "/dev/vdb";
+        fsType = "vfat";
+        autoFormat = true;
+        options = [ "umask=0077" "noatime" "nodev" "noexec" "nosuid" ];
+      };
+      # Broken since boot; every update keeps it broken.
+      systemd.services.already-broken = {
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig = { Type = "oneshot"; ExecStart = "${pkgs.coreutils}/bin/false"; };
+      };
       boot.loader.external = {
         enable = true;
         installHook = "${boot}/bin/boot-fixture";
       };
       specialisation = {
         good.configuration = generation "good";
+        # Changes the broken unit, so the switch restarts it and exits 4.
+        stillbroken.configuration = {
+          imports = [ (generation "stillbroken") ];
+          systemd.services.already-broken.environment.CHANGED = "1";
+        };
         broken.configuration = {
           imports = [ (generation "broken") ];
           systemd.services.broken-on-start = {
@@ -88,7 +106,7 @@ in
     def spec(name):
       return machine.succeed(f"readlink -f /run/current-system/specialisation/{name}").strip()
     base = machine.succeed("readlink -f /run/current-system").strip()
-    systems = {name: spec(name) for name in ["good", "broken", "bootfail", "stuck", "slow"]}
+    systems = {name: spec(name) for name in ["good", "broken", "bootfail", "stuck", "slow", "stillbroken"]}
 
     machine.succeed("install -d -m 0700 /run/update-ssh")
     client.succeed(
@@ -117,6 +135,7 @@ in
         f"--installable {systems[name]} --key-command ${pkgs.coreutils}/bin/cat --key-arg /root/{key}-key "
         "--activation-command ${activation}/bin/update-activation-fixture --activation-arg secrets "
         "--failure-command ${activation}/bin/update-activation-fixture --failure-arg report "
+        "--warning-command ${activation}/bin/update-activation-fixture --warning-arg warn "
         f"{extra}"
       )
 
@@ -124,7 +143,7 @@ in
       return {
         "current": machine.succeed("readlink /run/current-system").strip(),
         "profile": machine.succeed("readlink /nix/var/nix/profiles/system || echo none").strip(),
-        "boot": machine.succeed("cat /var/lib/test-boot/default 2>/dev/null || echo none").strip(),
+        "boot": machine.succeed("cat /boot/test-boot-default 2>/dev/null || echo none").strip(),
         "etc": machine.succeed("cat /etc/rollback-generation").strip(),
       }
 
@@ -132,10 +151,11 @@ in
       client.succeed("nix --extra-experimental-features nix-command store ping --store ssh-ng://update@machine")
       machine.succeed("systemctl is-active sshd.socket || systemctl is-active sshd.service")
       machine.succeed("test ! -e /var/lib/nix-update-remote/transaction.json")
-      machine.succeed("test -z \"$(systemctl list-units --failed --plain --no-legend)\"")
+      failed = machine.succeed("systemctl list-units --failed --plain --no-legend | cut -d' ' -f1").split()
+      assert failed == ["already-broken.service"], failed
 
     def reset_client():
-      client.succeed("rm -f /root/failure-reports /root/secrets-started /root/secrets-deployed /root/secrets-approve")
+      client.succeed("rm -f /root/failure-reports /root/warning-reports /root/secrets-started /root/secrets-deployed /root/secrets-approve")
 
     def events():
       machine.succeed("systemctl start system-update-report-delivery.service")
@@ -231,5 +251,33 @@ in
       assert f"after success {systems['slow']}" in events()
       machine.wait_for_unit("nix-update-remote.service")
       assert_reachable_and_clean()
+
+    with subtest("a unit already broken before the update stays broken: the update commits with a warning"):
+      reset_client()
+      client.succeed("touch /root/secrets-approve")
+      output = client.succeed(deploy("stillbroken") + " 2>&1")
+      assert "already-broken.service was already failed before the update and still is" in output, output
+      assert "exited with status 4" in output, output
+      kept = state()
+      assert kept["current"] == systems["stillbroken"] and kept["etc"] == "stillbroken", kept
+      assert kept["boot"] == systems["stillbroken"], kept
+      assert machine.succeed("readlink -f /nix/var/nix/profiles/system").strip() == systems["stillbroken"]
+      client.succeed("grep -F 'updated with warnings' /root/warning-reports | grep -F already-broken.service")
+      client.succeed("test ! -e /root/failure-reports")
+      client.succeed("test -e /root/secrets-deployed")
+      assert f"after success {systems['stillbroken']}" in events()
+      assert_reachable_and_clean()
+
+    with subtest("the broker can write /boot; a sandboxed transient unit cannot"):
+      for prop in ["ProtectSystem", "PrivateMounts", "ReadOnlyPaths", "InaccessiblePaths"]:
+        value = machine.succeed(f"systemctl show nix-update-remote.service -p {prop} --value").strip()
+        assert value in ("no", ""), (prop, value)
+      current = machine.succeed("readlink /run/current-system").strip()
+      machine.succeed(f"systemd-run --wait --collect --quiet ${boot}/bin/boot-fixture {current}")
+      # What failed on ns1: the probe under ProtectSystem, which remounts
+      # /boot read-only although the host mounts it read-write.
+      machine.fail(f"systemd-run --wait --collect --quiet -p ProtectSystem=full ${boot}/bin/boot-fixture {current}")
+      machine.succeed("journalctl -o cat | grep -F '/boot is not writable'")
+      machine.succeed("findmnt -no OPTIONS /boot | grep -w rw")
   '';
 }

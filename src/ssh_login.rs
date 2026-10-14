@@ -215,6 +215,14 @@ mod rollback_relay_tests {
     use super::*;
 
     #[test]
+    fn login_proxy_forwards_warnings_before_success() {
+        let input = b"ACTIVATED /nix/store/test-system\nWARNING old.service was already failed\nOK /nix/store/test-system\n";
+        let mut output = Vec::new();
+        relay_apply_response(&mut &input[..], &mut output, Path::new("/nix/store/test-system")).unwrap();
+        assert_eq!(output, input);
+    }
+
+    #[test]
     fn login_proxy_forwards_failure_and_rollback_and_fails() {
         let input = b"ACTIVATED /nix/store/test-system\nFAILED status 4\nWAITING rollback\nROLLED-BACK status 4; restored\n";
         let mut output = Vec::new();

@@ -55,6 +55,7 @@ impl Options {
 struct LogEvents;
 impl Events for LogEvents {
     fn activated(&mut self, _: &Path) {}
+    fn warning(&mut self, _: &str) {}
     fn failed(&mut self, reason: &str) {
         eprintln!("nix-update-remote: {reason}; rolling back");
     }
@@ -80,6 +81,9 @@ impl Events for StreamEvents<'_> {
     }
     fn waiting(&mut self, phase: &str) {
         self.line(format!("WAITING {}\n", protocol::one_line(phase)));
+    }
+    fn warning(&mut self, text: &str) {
+        self.line(format!("WARNING {}\n", protocol::one_line(text)));
     }
 }
 
@@ -300,7 +304,12 @@ enum Reply {
 
 fn report_outcome(outcome: &Outcome) -> &'static str {
     match outcome {
-        Outcome::Committed => "success",
+        Outcome::Committed { warnings } => {
+            for warning in warnings {
+                eprintln!("nix-update-remote: warning: {warning}");
+            }
+            "success"
+        }
         Outcome::RolledBack { failure, detail } => {
             eprintln!("nix-update-remote: rolled back update: {failure}; {detail}");
             "rolled-back"
@@ -418,7 +427,7 @@ fn apply_switch(stream: &mut UnixStream, options: &Options) -> Reply {
         Ok(outcome) => {
             let result = report_outcome(&outcome);
             (result, match outcome {
-                Outcome::Committed => Reply::Switched(resolved.clone(), false),
+                Outcome::Committed { .. } => Reply::Switched(resolved.clone(), false),
                 Outcome::RolledBack { failure, detail } => {
                     Reply::RolledBack(format!("{failure}; {detail}"))
                 }
@@ -539,7 +548,7 @@ mod tests {
                 assert!(matches!(outcome, Outcome::RolledBack { .. }), "{outcome:?}");
                 assert_eq!(host.profile_system(), Some(path("old")));
             } else {
-                assert_eq!(outcome, Outcome::Committed);
+                assert!(matches!(outcome, Outcome::Committed { .. }), "{outcome:?}");
                 assert_eq!(host.profile_system(), Some(path("new")));
             }
             assert_eq!(host.journal, None);

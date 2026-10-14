@@ -22,6 +22,10 @@ struct Plan {
     /// reason is appended as the last argument. Empty: none.
     #[serde(default)]
     failure_command: Vec<String>,
+    /// Reports what an update that succeeded left broken; the text is
+    /// appended as the last argument. Empty: none.
+    #[serde(default)]
+    warning_command: Vec<String>,
     ssh_arguments: Vec<String>,
     copy_ssh_arguments: Vec<String>,
     reboot: bool,
@@ -39,11 +43,11 @@ fn expanded(values: &[String], replacements: &BTreeMap<&str, String>) -> Vec<Str
 // Nix parses NIX_SSHOPTS as shell words, but never executes this string.
 fn quote(value: &str) -> String { format!("'{}'", value.replace('\'', "'\\''")) }
 /// The backend options that report a failed update through the plan's reporter.
-fn reporter_arguments(command: &[String], replacements: &BTreeMap<&str, String>) -> Vec<String> {
+fn reporter_arguments(kind: &str, command: &[String], replacements: &BTreeMap<&str, String>) -> Vec<String> {
     let command = expanded(command, replacements);
     let Some((program, arguments)) = command.split_first() else { return Vec::new() };
-    let mut options = vec!["--failure-command".to_owned(), program.clone()];
-    for argument in arguments { options.extend(["--failure-arg".to_owned(), argument.clone()]); }
+    let mut options = vec![format!("--{kind}-command"), program.clone()];
+    for argument in arguments { options.extend([format!("--{kind}-arg"), argument.clone()]); }
     options
 }
 struct PublicKey(std::path::PathBuf);
@@ -121,7 +125,11 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
         child.arg("--login-approval-command").arg(program);
         for argument in arguments { child.arg("--login-approval-arg").arg(argument); }
     }
-    child.args(reporter_arguments(&plan.failure_command, &replacements));
+    child.args(reporter_arguments("failure", &plan.failure_command, &replacements));
+    // Only closure switches commit with warnings.
+    if plan.backend == "deploy" {
+        child.args(reporter_arguments("warning", &plan.warning_command, &replacements));
+    }
     for argument in ssh_arguments { child.arg("--ssh-arg").arg(argument); }
     if plan.reboot && !no_reboot { child.arg("--reboot"); }
     child.env("NIX_SSHOPTS", copy_arguments.iter().map(|v| quote(v)).collect::<Vec<_>>().join(" "));
@@ -141,9 +149,10 @@ mod tests {
         let map = BTreeMap::from([("{host}", "ns1".to_owned())]);
         let plan = ["/nix-secrets".to_owned(), "procedure-step-failed".into(), "--label".into(), "update {host}".into(), "--reason".into()];
         assert_eq!(
-            reporter_arguments(&plan, &map),
+            reporter_arguments("failure", &plan, &map),
             ["--failure-command", "/nix-secrets", "--failure-arg", "procedure-step-failed", "--failure-arg", "--label", "--failure-arg", "update ns1", "--failure-arg", "--reason"]
         );
-        assert!(reporter_arguments(&[], &map).is_empty());
+        assert!(reporter_arguments("failure", &[], &map).is_empty());
+        assert_eq!(reporter_arguments("warning", &["/w".to_owned(), "{host}".into()], &map), ["--warning-command", "/w", "--warning-arg", "ns1"]);
     }
 }

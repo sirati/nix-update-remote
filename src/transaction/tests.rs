@@ -39,7 +39,7 @@ fn run(host: &mut FakeHost) -> (Outcome, Recorder) {
 fn healthy_update_commits_profile_and_bootloader_only_after_the_health_gate() {
     let mut host = host_with(new_system());
     let (outcome, events) = run(&mut host);
-    assert_eq!(outcome, Outcome::Committed);
+    assert_eq!(outcome, Outcome::Committed { warnings: Vec::new() });
     assert_eq!(events.0, [format!("ACTIVATED {}", path("new").display())]);
     assert_eq!(host.current, path("new"));
     assert_eq!(host.profile_system(), Some(path("new")));
@@ -125,7 +125,7 @@ fn failures_that_predate_the_update_do_not_block_it() {
     let mut host = host_with(new_system());
     host.systems.get_mut(&path("new")).unwrap().failing_later.insert("pre-broken.service".into());
     let (outcome, _) = run(&mut host);
-    assert_eq!(outcome, Outcome::Committed);
+    assert!(matches!(outcome, Outcome::Committed { .. }), "{outcome:?}");
 }
 
 #[test]
@@ -263,5 +263,43 @@ fn a_removed_unit_that_failed_while_stopping_does_not_block_the_update() {
     let old = old.clone();
     host.activate_for_test(&path("old"), old);
     let (outcome, _) = run(&mut host);
-    assert_eq!(outcome, Outcome::Committed);
+    assert!(matches!(outcome, Outcome::Committed { .. }), "{outcome:?}");
+}
+
+#[test]
+fn a_unit_already_broken_before_the_update_commits_it_with_a_warning() {
+    // switch-to-configuration exits 4 because the old breakage persists;
+    // nothing regressed, so the update stands and the operator is told.
+    let mut new = new_system();
+    new.failing.insert("pre-broken.service".into());
+    let mut host = host_with(new);
+    let (outcome, events) = run(&mut host);
+    let Outcome::Committed { warnings } = outcome else { panic!("rolled back: {outcome:?}") };
+    assert_eq!(
+        warnings,
+        [
+            "switch-to-configuration test exited with status 4".to_owned(),
+            "pre-broken.service was already failed before the update and still is".into(),
+        ]
+    );
+    assert!(events.0.iter().any(|e| e == "WARNING pre-broken.service was already failed before the update and still is"));
+    assert!(!events.0.iter().any(|e| e.starts_with("FAILED")));
+    assert_eq!(host.current, path("new"));
+    assert_eq!(host.profile_system(), Some(path("new")));
+    assert_eq!(host.boot_entry, Some(path("new")));
+}
+
+#[test]
+fn a_switch_that_never_activated_the_new_system_rolls_back() {
+    // A non-zero exit before activation leaves the old system running; the
+    // update must not commit a system that never ran.
+    let mut host = host_with(new_system());
+    host.systems.get_mut(&path("new")).unwrap().test_exit = 100;
+    host.never_activates.insert(path("new"));
+    let (outcome, _) = run(&mut host);
+    assert!(
+        matches!(&outcome, Outcome::RolledBack { failure, .. } if failure.contains("did not become the current system")),
+        "{outcome:?}"
+    );
+    assert_restored(&host);
 }

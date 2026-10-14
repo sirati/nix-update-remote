@@ -65,6 +65,8 @@ pub trait Events {
     fn failed(&mut self, reason: &str);
     /// Still working; keeps a waiting client from timing out.
     fn waiting(&mut self, phase: &str);
+    /// Something the operator must see that does not fail the update.
+    fn warning(&mut self, text: &str);
 }
 
 /// What the transaction needs from the host. The daemon implements it on the
@@ -114,7 +116,8 @@ pub trait Host {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    Committed,
+    /// The new system is healthy; `warnings` name what was already broken.
+    Committed { warnings: Vec<String> },
     /// The new system failed; the previous one is restored and verified.
     RolledBack { failure: String, detail: String },
     /// The new system failed and the rollback could not be verified.
@@ -150,9 +153,26 @@ pub fn update(host: &mut dyn Host, new: &Path, events: &mut dyn Events) -> Resul
     host.write_journal(&journal)
         .map_err(|error| format!("cannot record the update journal: {error}"))?;
 
+    // A non-zero exit only says that some unit failed. The health gate
+    // decides whether anything regressed; a unit that was already broken
+    // before the update is a warning, not a reason to roll back.
+    let mut warnings = Vec::new();
     let failure = match host.switch(new, Action::Test, Some(&journal.failed_before), events) {
-        Ok(Some(0)) => health(host, &journal, events).err(),
-        Ok(code) => Some(with_failed_units(host, &journal, exit_text(Action::Test, code))),
+        Ok(Some(code)) => {
+            let exit = (code != 0).then(|| exit_text(Action::Test, Some(code)));
+            match health(host, &journal, new, events) {
+                Ok(found) => {
+                    warnings.extend(exit);
+                    warnings.extend(found);
+                    None
+                }
+                Err(problem) => Some(match exit {
+                    Some(exit) => format!("{exit}; {problem}"),
+                    None => problem,
+                }),
+            }
+        }
+        Ok(None) => Some(with_failed_units(host, &journal, exit_text(Action::Test, None))),
         Err(error) => Some(format!("activating the new system failed: {error}")),
     };
     if let Some(failure) = failure {
@@ -179,7 +199,10 @@ pub fn update(host: &mut dyn Host, new: &Path, events: &mut dyn Events) -> Resul
         // daemon start; say so loudly instead of failing a good update.
         eprintln!("nix-update-remote: cannot clear the committed update journal: {error}");
     }
-    Ok(Outcome::Committed)
+    for warning in &warnings {
+        events.warning(warning);
+    }
+    Ok(Outcome::Committed { warnings })
 }
 
 /// Units of the running system that failed since the update began. A unit
@@ -211,10 +234,18 @@ fn with_failed_units(host: &dyn Host, journal: &Journal, reason: String) -> Stri
     }
 }
 
-/// The health gate of the new system.
-fn health(host: &mut dyn Host, journal: &Journal, events: &mut dyn Events) -> Result<(), String> {
+/// The health gate of the new system: returns warnings, or the regression.
+fn health(
+    host: &mut dyn Host,
+    journal: &Journal,
+    new: &Path,
+    events: &mut dyn Events,
+) -> Result<Vec<String>, String> {
     host.settle(events);
     let mut problems = Vec::new();
+    if host.current_system().as_deref() != Some(new) {
+        problems.push("the new system did not become the current system".to_owned());
+    }
     if let Err(error) = host.run_health_units(&journal.failed_before, events) {
         problems.push(format!("health check failed: {error}"));
     }
@@ -232,10 +263,22 @@ fn health(host: &mut dyn Host, journal: &Journal, events: &mut dyn Events) -> Re
         Err(error) => problems.push(format!("cannot check sshd: {error}")),
     }
     if problems.is_empty() {
-        Ok(())
+        Ok(still_failed(host, journal))
     } else {
         Err(format!("the new system is unhealthy: {}", problems.join("; ")))
     }
+}
+
+/// Units that were already failed before the update and still are.
+fn still_failed(host: &dyn Host, journal: &Journal) -> Vec<String> {
+    let Ok(failed) = host.failed_units() else { return Vec::new() };
+    let old: BTreeSet<String> = failed.intersection(&journal.failed_before).cloned().collect();
+    host.unit_states(&old)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|state| state.loaded)
+        .map(|state| format!("{} was already failed before the update and still is", state.id))
+        .collect()
 }
 
 /// Restores the system recorded in `journal` and verifies it.
@@ -261,8 +304,8 @@ pub fn rollback(
     // Status 4 only says that some unit failed; verification below decides
     // whether that is new.
     match host.switch(previous, Action::Test, None, events) {
-        Ok(Some(0 | 4)) => {}
-        Ok(code) => problems.push(format!("reactivating the previous system failed: {}", exit_text(Action::Test, code))),
+        Ok(Some(_)) => {}
+        Ok(None) => problems.push(format!("reactivating the previous system failed: {}", exit_text(Action::Test, None))),
         Err(error) => problems.push(format!("reactivating the previous system failed: {error}")),
     }
     if journal.phase == Phase::Committing {
