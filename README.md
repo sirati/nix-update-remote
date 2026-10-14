@@ -195,7 +195,40 @@ Closure updates accept `--activation-command PROGRAM` and repeated
 startup may still be waiting for credentials. The client waits for both the
 callback and the activation result, and keeps its checkout GC roots the whole
 time. A secrets provider can then ask for operator approval without waiting
-behind services that need its values.
+behind services that need its values. The client never starts the callback
+after the host reports a failure, and stops it as soon as one arrives.
+
+A switch either ends in the new system, healthy, or in the previous system,
+restored:
+
+1. The broker records a journal, then runs `switch-to-configuration test`. The
+   profile and the bootloader still name the previous system.
+2. A unit of the new system that fails and stays failed ends the switch at once,
+   even while other units still wait. Afterwards the health gate gives units a
+   few seconds to fail (`health.settleSeconds`), starts `health.units` and checks
+   that sshd listens on `health.sshPorts`. Units that already failed before the
+   update do not count.
+3. Only then does the broker set the profile and run
+   `switch-to-configuration boot`.
+4. Any failure on the way rolls back. The broker restores the profile link and,
+   if it was touched, the bootloader entry. It reactivates the previous system,
+   restarts the units the failed switch left down, and verifies sshd, the failed
+   units and the services that ran before.
+5. A broker that restarts with a journal from the same boot rolls back the switch
+   it interrupted.
+
+The client receives `ACTIVATED`, `WAITING` (keepalive) and `FAILED <reason>`
+progress lines, then one verdict:
+
+- `OK`.
+- `REJECTED <reason>`: the host is unchanged.
+- `ROLLED-BACK <reason>`: the previous system is restored and verified.
+- `ROLLBACK-FAILED <reason>`: the host needs attention.
+
+A client that disconnects does not stop the switch or its rollback. With
+`--failure-command PROGRAM` and repeated `--failure-arg ARG`, the client reports
+every failure as soon as it is known, with the reason as the last argument. A
+configured plan sets this with `failureCommand`.
 
 An integration may supply `--post-command PROGRAM` with repeated `--post-arg ARG`
 for operator work after an update. With `--reboot`, the generation workflow waits

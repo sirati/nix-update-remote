@@ -119,7 +119,41 @@ fn optional_enabled(
         impure,
     )
 }
+/// Splits the failure reporter off the generation options; every other
+/// option but the flags takes one value.
+fn failure_reporter(args: &[String]) -> Result<(Vec<String>, Option<(PathBuf, Vec<String>)>), String> {
+    let mut rest = Vec::new();
+    let mut command = None;
+    let mut reporter_args = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--impure" | "--reboot" => rest.push(arg.clone()),
+            "--failure-command" => command = Some(PathBuf::from(iter.next().ok_or("missing failure command")?)),
+            "--failure-arg" => reporter_args.push(iter.next().ok_or("missing failure argument")?.clone()),
+            _ => {
+                rest.push(arg.clone());
+                rest.extend(iter.next().cloned());
+            }
+        }
+    }
+    if command.is_none() && !reporter_args.is_empty() {
+        return Err("failure arguments require --failure-command".into());
+    }
+    Ok((rest, command.map(|command| (command, reporter_args))))
+}
+
 pub fn deploy(args: &[String]) -> Result<(), String> {
+    let (args, reporter) = failure_reporter(args)?;
+    let result = deploy_generation(&args);
+    if let (Err(error), Some((command, reporter_args))) = (&result, &reporter) {
+        eprintln!("nix-update-remote: {error}");
+        crate::client::report_with(command, reporter_args, error);
+    }
+    result
+}
+
+fn deploy_generation(args: &[String]) -> Result<(), String> {
     let mut installable = None;
     let mut nix = PathBuf::from("nix");
     let mut pass = Vec::new();
@@ -280,6 +314,17 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_reporter_is_split_off_without_shifting_option_values() {
+        let args: Vec<String> = ["--impure", "--sign-arg", "--failure-command", "--failure-command", "/r", "--failure-arg", "x", "--reboot"]
+            .map(String::from)
+            .to_vec();
+        let (rest, reporter) = failure_reporter(&args).unwrap();
+        assert_eq!(rest, ["--impure", "--sign-arg", "--failure-command", "--reboot"]);
+        assert_eq!(reporter, Some((PathBuf::from("/r"), vec!["x".to_owned()])));
+        assert!(failure_reporter(&["--failure-arg".into(), "x".into()]).is_err());
+    }
 
     #[test]
     fn presence_probe_quotes_only_plain_leaf_names() {

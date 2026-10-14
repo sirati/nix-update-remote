@@ -117,3 +117,87 @@ pub fn parse_artifact_receipt(bytes: &[u8]) -> Result<(PathBuf, bool), String> {
     }
     Ok((PathBuf::from(system), reboot))
 }
+
+/// Most bytes of free text in one response line.
+pub const MAX_REASON: usize = 2000;
+
+/// Free text as one bounded response line without control characters.
+pub fn one_line(text: &str) -> String {
+    let mut line = String::new();
+    for character in text.chars() {
+        let character = if character.is_control() { ' ' } else { character };
+        if line.len() + character.len_utf8() > MAX_REASON {
+            break;
+        }
+        line.push(character);
+    }
+    line
+}
+
+/// One line of the closure switch response, as the broker sends it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SwitchLine {
+    Activated(PathBuf),
+    Failed(String),
+    Waiting,
+    Ok(PathBuf),
+    /// Nothing changed on the host. Legacy brokers give no reason.
+    Rejected(String),
+    RolledBack(String),
+    RollbackFailed(String),
+}
+
+impl SwitchLine {
+    pub fn parse(line: &str) -> Result<Self, String> {
+        let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
+        Ok(match word {
+            "ACTIVATED" => SwitchLine::Activated(PathBuf::from(rest)),
+            "FAILED" => SwitchLine::Failed(rest.to_owned()),
+            "WAITING" => SwitchLine::Waiting,
+            "OK" => SwitchLine::Ok(PathBuf::from(rest)),
+            "REJECTED" => SwitchLine::Rejected(rest.to_owned()),
+            "ROLLED-BACK" => SwitchLine::RolledBack(rest.to_owned()),
+            "ROLLBACK-FAILED" => SwitchLine::RollbackFailed(rest.to_owned()),
+            _ if line == "ERR update rejected" => SwitchLine::Rejected(String::new()),
+            _ => return Err("invalid remote switch response".into()),
+        })
+    }
+
+    pub fn is_final(&self) -> bool {
+        !matches!(self, SwitchLine::Activated(_) | SwitchLine::Failed(_) | SwitchLine::Waiting)
+    }
+
+    /// What the operator is told about a final line other than `OK`.
+    pub fn failure(&self) -> Option<String> {
+        let reason = |text: &str| if text.is_empty() { String::new() } else { format!(": {text}") };
+        match self {
+            SwitchLine::Rejected(text) => Some(format!("update rejected, the host is unchanged{}", reason(text))),
+            SwitchLine::RolledBack(text) => Some(format!("update failed and was rolled back{}", reason(text))),
+            SwitchLine::RollbackFailed(text) => Some(format!(
+                "update failed and ROLLING BACK FAILED, the host needs attention{}",
+                reason(text)
+            )),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod switch_line_tests {
+    use super::*;
+
+    #[test]
+    fn responses_keep_their_kind_and_reason() {
+        assert_eq!(SwitchLine::parse("ERR update rejected").unwrap(), SwitchLine::Rejected(String::new()));
+        assert_eq!(
+            SwitchLine::parse("ROLLED-BACK units failed: a.service").unwrap(),
+            SwitchLine::RolledBack("units failed: a.service".into())
+        );
+        assert!(SwitchLine::parse("ROLLED-BACK x").unwrap().failure().unwrap().contains("rolled back: x"));
+        assert!(SwitchLine::parse("REJECTED x").unwrap().failure().unwrap().contains("unchanged"));
+        assert!(!SwitchLine::parse("FAILED x").unwrap().is_final());
+        assert!(SwitchLine::parse("SOMETHING").is_err());
+        assert_eq!(one_line("a\nb\x1b"), "a b ");
+        assert_eq!(one_line(&"é".repeat(MAX_REASON)).len(), MAX_REASON);
+    }
+}

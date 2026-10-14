@@ -55,6 +55,27 @@ fn nix_daemon() -> Result<(), String> {
 }
 
 fn proxy_apply() -> Result<(), String> {
+    let (request, system) = match checked_apply_request() {
+        Ok(checked) => checked,
+        Err(error) => {
+            // The client hears that nothing changed, not that the line died.
+            println!("REJECTED {}", protocol::one_line(&error));
+            return Err(error);
+        }
+    };
+    let mut socket = UnixStream::connect(protocol::SOCKET).map_err(|error| error.to_string())?;
+    socket
+        .write_all(&request)
+        .map_err(|error| error.to_string())?;
+    socket
+        .shutdown(Shutdown::Write)
+        .map_err(|error| error.to_string())?;
+    relay_apply_response(&mut socket, &mut io::stdout(), &system)
+}
+
+/// The request and its system, verified with the update account's trust
+/// before the broker sees it.
+fn checked_apply_request() -> Result<(Vec<u8>, std::path::PathBuf), String> {
     let mut request = Vec::new();
     io::stdin()
         .take(protocol::MAX_REQUEST)
@@ -70,14 +91,7 @@ fn proxy_apply() -> Result<(), String> {
         &static_keys,
         runtime_keys.as_deref(),
     )?;
-    let mut socket = UnixStream::connect(protocol::SOCKET).map_err(|error| error.to_string())?;
-    socket
-        .write_all(&request)
-        .map_err(|error| error.to_string())?;
-    socket
-        .shutdown(Shutdown::Write)
-        .map_err(|error| error.to_string())?;
-    relay_apply_response(&mut socket, &mut io::stdout(), &system)
+    Ok((request, system))
 }
 
 fn relay_apply_response(
@@ -85,32 +99,34 @@ fn relay_apply_response(
     writer: &mut impl Write,
     system: &Path,
 ) -> Result<(), String> {
+    use protocol::SwitchLine;
     let mut activated = false;
-    for _ in 0..2 {
+    let mut failed = false;
+    loop {
         let line = protocol::read_control_line(reader)?;
-        let progress = line == format!("ACTIVATED {}", system.display());
-        let success = line == format!("OK {}", system.display());
-        let failure = line == "ERR update rejected";
-        if progress && !activated {
-            activated = true;
-        } else if !success && !failure {
+        let parsed = SwitchLine::parse(&line)?;
+        let valid = match &parsed {
+            SwitchLine::Activated(path) => path == system && !std::mem::replace(&mut activated, true),
+            SwitchLine::Failed(_) => !std::mem::replace(&mut failed, true),
+            SwitchLine::Ok(path) => path == system && !failed,
+            _ => true,
+        };
+        if !valid {
             return Err("invalid broker activation response".into());
         }
         writeln!(writer, "{line}").map_err(|e| e.to_string())?;
         writer.flush().map_err(|e| e.to_string())?;
-        if success || failure {
+        if parsed.is_final() {
             let mut trailing = [0];
             if reader.read(&mut trailing).map_err(|e| e.to_string())? != 0 {
                 return Err("trailing broker response".into());
             }
-            return if success {
-                Ok(())
-            } else {
-                Err("update daemon rejected the request".into())
+            return match parsed.failure() {
+                None => Ok(()),
+                Some(failure) => Err(failure),
             };
         }
     }
-    Err("missing final broker activation response".into())
 }
 
 fn trust_from_environment() -> Result<(Vec<String>, Option<std::path::PathBuf>), String> {
@@ -190,6 +206,27 @@ mod progress_tests {
                 )
                 .is_err()
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod rollback_relay_tests {
+    use super::*;
+
+    #[test]
+    fn login_proxy_forwards_failure_and_rollback_and_fails() {
+        let input = b"ACTIVATED /nix/store/test-system\nFAILED status 4\nWAITING rollback\nROLLED-BACK status 4; restored\n";
+        let mut output = Vec::new();
+        let error = relay_apply_response(&mut &input[..], &mut output, Path::new("/nix/store/test-system")).unwrap_err();
+        assert!(error.contains("rolled back: status 4; restored"), "{error}");
+        assert_eq!(output, input);
+        for bytes in [
+            b"FAILED a\nFAILED b\n".as_slice(),
+            b"FAILED a\nOK /nix/store/test-system\n",
+            b"REJECTED x\ntrailing",
+        ] {
+            assert!(relay_apply_response(&mut &bytes[..], &mut Vec::new(), Path::new("/nix/store/test-system")).is_err());
         }
     }
 }

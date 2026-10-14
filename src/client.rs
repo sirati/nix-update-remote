@@ -5,7 +5,8 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct Options {
     target: String,
@@ -22,10 +23,21 @@ struct Options {
     post_args: Vec<String>,
     ssh_args: Vec<String>,
     login_approval: crate::login_approval::LoginApproval,
+    failure_command: Option<PathBuf>,
+    failure_args: Vec<String>,
 }
 
 pub fn deploy(args: &[String]) -> Result<(), String> {
     let options = parse(args)?;
+    let result = deploy_with(&options);
+    if let Err(error) = &result {
+        // Every failure stops the update here, before any later step.
+        report_failure(&options, error);
+    }
+    result
+}
+
+fn deploy_with(options: &Options) -> Result<(), String> {
     validate_target(&options.target)?;
     if let Some(key) = &options.signing_key {
         validate_key(key)?;
@@ -165,6 +177,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut post_command = None;
     let mut post_args = Vec::new();
     let mut ssh_args = Vec::new();
+    let mut failure_command = None;
+    let mut failure_args = Vec::new();
     let mut login_approval = crate::login_approval::LoginApproval::default();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -201,12 +215,23 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--post-arg" => {
                 post_args.push(iter.next().ok_or("missing post-update argument")?.clone())
             }
+            "--failure-command" => {
+                failure_command = Some(PathBuf::from(
+                    iter.next().ok_or("missing failure command")?,
+                ))
+            }
+            "--failure-arg" => {
+                failure_args.push(iter.next().ok_or("missing failure argument")?.clone())
+            }
             _ => return Err(format!("unknown deploy argument: {arg}")),
         }
     }
     login_approval.validate()?;
     if !activation_args.is_empty() && activation_command.is_none() {
         return Err("activation arguments require --activation-command".into());
+    }
+    if !failure_args.is_empty() && failure_command.is_none() {
+        return Err("failure arguments require --failure-command".into());
     }
     if !post_args.is_empty() && post_command.is_none() {
         return Err("post-update arguments require --post-command".into());
@@ -244,6 +269,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         post_args,
         ssh_args,
         login_approval,
+        failure_command,
+        failure_args,
     })
 }
 
@@ -306,7 +333,8 @@ fn store_uri(target: &str) -> Result<String, String> {
 }
 
 // Killing or interrupting the local client must reap its SSH child. A remote
-// activation already in progress continues under the root broker.
+// activation already in progress continues under the root broker, which
+// finishes it or rolls it back by itself.
 struct ApplyChild(crate::cancellation::ManagedChild);
 impl Drop for ApplyChild {
     fn drop(&mut self) {
@@ -314,6 +342,10 @@ impl Drop for ApplyChild {
         let _ = self.0.wait();
     }
 }
+
+/// How long the broker may stay silent while no local step runs. Current
+/// brokers send keepalives; older ones are silent until their verdict.
+const SILENCE_LIMIT: Duration = Duration::from_secs(600);
 
 fn apply(options: &Options, system: &Path, transport: &Transport) -> Result<(), String> {
     let target = &options.target;
@@ -333,70 +365,153 @@ fn apply(options: &Options, system: &Path, transport: &Transport) -> Result<(), 
         .ok_or("missing SSH stdin")?
         .write_all(protocol::request(system).as_bytes())
         .map_err(|e| e.to_string())?;
-    let mut response = TimedResponse(child.0.stdout.take().ok_or("missing SSH stdout")?);
-    let mut callback_ran = false;
-    let final_line = consume_progress(&mut response, system, || {
-        activation_callback(options)?;
-        callback_ran = true;
-        Ok(())
-    })?;
+    let lines = read_lines(child.0.stdout.take().ok_or("missing SSH stdout")?);
+    follow(
+        &lines,
+        system,
+        &mut || activation_callback(options),
+        &mut |message| report_failure(options, message),
+        SILENCE_LIMIT,
+    )?;
     let status = child.0.wait().map_err(|error| error.to_string())?;
-    if !status.success() || final_line != format!("OK {}", system.display()) {
+    if !status.success() {
         return Err("remote switch failed or returned an invalid response".into());
-    }
-    // Legacy brokers emit only the final receipt. Successful completion
-    // still runs the callback exactly once without opening another channel.
-    if !callback_ran {
-        activation_callback(options)?;
     }
     println!("switched {} to {}", target, system.display());
     Ok(())
 }
 
-struct TimedResponse(std::process::ChildStdout);
-impl Read for TimedResponse {
-    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        use rustix::event::{PollFd, PollFlags, Timespec, poll};
-        let mut descriptors = [PollFd::new(&self.0, PollFlags::IN)];
-        let timeout = Timespec {
-            tv_sec: 600,
-            tv_nsec: 0,
-        };
-        if poll(&mut descriptors, Some(&timeout))? == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "remote activation produced no progress for 10 minutes; an older broker may need secrets deployed before this upgrade",
-            ));
-        }
-        self.0.read(bytes)
-    }
-}
-
-fn consume_progress(
-    reader: &mut impl Read,
-    system: &Path,
-    mut activated: impl FnMut() -> Result<(), String>,
-) -> Result<String, String> {
-    let expected = format!("ACTIVATED {}", system.display());
-    let mut seen = false;
-    for _ in 0..2 {
-        let line = protocol::read_control_line(reader)?;
-        if line == expected && !seen {
-            seen = true;
-            activated()?;
-        } else if line == format!("OK {}", system.display()) || line == "ERR update rejected" {
-            let mut byte = [0];
-            if reader.read(&mut byte).map_err(|e| e.to_string())? != 0 {
-                return Err("trailing remote switch response".into());
+/// Response lines of the broker, read off the SSH channel as they arrive.
+fn read_lines(mut stream: impl Read + Send + 'static) -> mpsc::Receiver<Result<String, String>> {
+    let (sender, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        loop {
+            let line = protocol::read_control_line(&mut stream);
+            let last = line.as_ref().map_or(true, |line| {
+                protocol::SwitchLine::parse(line).map_or(true, |parsed| parsed.is_final())
+            });
+            if last {
+                let line = line.and_then(|line| {
+                    let mut byte = [0];
+                    match stream.read(&mut byte) {
+                        Ok(0) => Ok(line),
+                        _ => Err("trailing remote switch response".into()),
+                    }
+                });
+                let _ = sender.send(line);
+                return;
             }
-            return Ok(line);
-        } else {
-            return Err("invalid or duplicate activation progress event".into());
+            if sender.send(line).is_err() {
+                return;
+            }
         }
-    }
-    Err("missing final remote switch result".into())
+    });
+    lines
 }
 
+/// A local step that runs while the host activates.
+trait Running {
+    /// `Some(success)` once it ended.
+    fn poll(&mut self) -> Result<Option<bool>, String>;
+}
+
+struct CallbackChild(crate::cancellation::ManagedChild);
+impl Running for CallbackChild {
+    fn poll(&mut self) -> Result<Option<bool>, String> {
+        Ok(self.0.try_wait().map_err(|e| e.to_string())?.map(|status| status.success()))
+    }
+}
+
+/// Follows the broker's response to its verdict. The activation callback
+/// (the secret deployment) starts when the new system is installed, because
+/// its services may wait for it; it is stopped as soon as the host reports a
+/// failure and never started after one. Only `OK` with a successful callback
+/// is success.
+fn follow(
+    lines: &mpsc::Receiver<Result<String, String>>,
+    system: &Path,
+    start: &mut dyn FnMut() -> Result<Option<Box<dyn Running>>, String>,
+    report: &mut dyn FnMut(&str),
+    silence_limit: Duration,
+) -> Result<(), String> {
+    use protocol::SwitchLine;
+    let mut activated = false;
+    let mut failed = false;
+    let mut running: Option<Box<dyn Running>> = None;
+    let mut callback: Option<Result<(), String>> = None;
+    let mut last = Instant::now();
+    let callback_failed = || Err("configuration activation operation failed".to_owned());
+    loop {
+        if let Some(step) = running.as_mut() {
+            if let Some(success) = step.poll()? {
+                running = None;
+                callback = Some(if success { Ok(()) } else { callback_failed() });
+                last = Instant::now();
+                if !success {
+                    report("the activation callback failed while the host activates; waiting for the host");
+                }
+            }
+        }
+        let line = match lines.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => line,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if running.is_none() && last.elapsed() >= silence_limit {
+                    return Err("remote activation produced no progress for 10 minutes; an older broker may need secrets deployed before this upgrade".into());
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err("the response ended".into()),
+        };
+        last = Instant::now();
+        let line = match line.and_then(|line| SwitchLine::parse(&line)) {
+            Ok(line) => line,
+            Err(error) => {
+                // Dropping a running callback stops it.
+                return Err(format!(
+                    "lost the update connection before the host's verdict ({error}); \
+                     the host finishes the update or rolls it back by itself"
+                ));
+            }
+        };
+        match line {
+            SwitchLine::Activated(path) if path == system && !activated => {
+                activated = true;
+                if !failed {
+                    running = start()?;
+                    if running.is_none() {
+                        callback = Some(Ok(()));
+                    }
+                }
+            }
+            SwitchLine::Failed(reason) if !failed => {
+                failed = true;
+                running = None;
+                report(&format!("activation failed, the host is rolling back: {reason}"));
+            }
+            SwitchLine::Waiting => {}
+            SwitchLine::Ok(path) if path == system && !failed => {
+                if !activated {
+                    // Legacy brokers emit only the final receipt.
+                    running = start()?;
+                    callback = Some(Ok(()));
+                }
+                while let Some(step) = running.as_mut() {
+                    if let Some(success) = step.poll()? {
+                        running = None;
+                        callback = Some(if success { Ok(()) } else { callback_failed() });
+                    } else {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+                return callback.unwrap_or_else(callback_failed);
+            }
+            verdict if verdict.is_final() && verdict.failure().is_some() => {
+                return Err(verdict.failure().unwrap());
+            }
+            _ => return Err("invalid or duplicate activation progress event".into()),
+        }
+    }
+}
 struct Transport {
     directory: PathBuf,
     master: Option<crate::cancellation::ManagedChild>,
@@ -501,14 +616,37 @@ impl Drop for Transport {
     }
 }
 
-fn activation_callback(options: &Options) -> Result<(), String> {
-    if let Some(command) = &options.activation_command {
-        run(
-            Command::new(command).args(&options.activation_args),
-            "configuration activation operation",
-        )?;
+fn activation_callback(options: &Options) -> Result<Option<Box<dyn Running>>, String> {
+    let Some(command) = &options.activation_command else {
+        return Ok(None);
+    };
+    let child = Command::new(command)
+        .args(&options.activation_args)
+        .stdin(Stdio::null())
+        .managed_spawn()
+        .map_err(|e| format!("configuration activation operation: {e}"))?;
+    Ok(Some(Box::new(CallbackChild(child))))
+}
+
+/// Tells the operator about a failure as soon as it is known, through the
+/// configured reporter (such as a procedure step in the operator's TUI).
+/// Reporting never changes the outcome.
+fn report_failure(options: &Options, message: &str) {
+    eprintln!("nix-update-remote: {message}");
+    if let Some(command) = &options.failure_command {
+        report_with(command, &options.failure_args, message);
     }
-    Ok(())
+}
+
+pub fn report_with(command: &Path, args: &[String], message: &str) {
+    let status = Command::new(command)
+        .args(args)
+        .arg(protocol::one_line(message))
+        .stdin(Stdio::null())
+        .managed_status();
+    if !status.is_ok_and(|status| status.success()) {
+        eprintln!("nix-update-remote: the failure reporter did not confirm the report");
+    }
 }
 
 fn run(command: &mut Command, action: &str) -> Result<(), String> {
@@ -578,62 +716,215 @@ mod tests {
 
     #[test]
     fn activation_callback_precedes_final_receipt_on_same_stream() {
-        let (mut server, mut client) = std::os::unix::net::UnixStream::pair().unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let (notice, confirmed) = std::sync::mpsc::channel();
+        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let lines = read_lines(client);
+        let (notice, confirmed) = mpsc::channel();
         let writer = std::thread::spawn(move || {
-            server
-                .write_all(b"ACTIVATED /nix/store/test-system\n")
-                .unwrap();
+            server.write_all(b"ACTIVATED /nix/store/test-system\n").unwrap();
             confirmed.recv_timeout(Duration::from_secs(2)).unwrap();
             server.write_all(b"OK /nix/store/test-system\n").unwrap();
         });
-        let mut callbacks = 0;
-        let receipt = consume_progress(&mut client, Path::new("/nix/store/test-system"), || {
-            callbacks += 1;
-            notice.send(()).unwrap();
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(callbacks, 1);
-        assert_eq!(receipt, "OK /nix/store/test-system");
+        let probe = Probe::default();
+        let mut start = probe.starter(Some(true));
+        let result = follow(
+            &lines,
+            Path::new("/nix/store/test-system"),
+            &mut || {
+                notice.send(()).unwrap();
+                start()
+            },
+            &mut |_| panic!("nothing failed"),
+            SILENCE_LIMIT,
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(probe.started.load(Ordering::SeqCst), 1);
         writer.join().unwrap();
     }
-    #[test]
-    fn progress_is_not_final_success_and_invalid_events_are_rejected() {
-        let system = Path::new("/nix/store/test-system");
-        let mut callbacks = 0;
-        let result = consume_progress(
-            &mut &b"ACTIVATED /nix/store/test-system\nERR update rejected\n"[..],
-            system,
-            || {
-                callbacks += 1;
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(callbacks, 1);
-        assert_eq!(result, "ERR update rejected");
-        for bytes in [
-            b"ACTIVATED /nix/store/wrong\n".as_slice(),
-            b"ACTIVATED /nix/store/test-system\nACTIVATED /nix/store/test-system\n",
-            b"OK /nix/store/test-system\nextra",
-            b"ACTIVATED /nix/store/test-system\n",
-        ] {
-            assert!(consume_progress(&mut &bytes[..], system, || Ok(())).is_err());
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// A callback that ends with `outcome` (or never) and records whether it
+    /// was stopped before it ended.
+    #[derive(Clone, Default)]
+    struct Probe {
+        started: Arc<AtomicUsize>,
+        stopped: Arc<AtomicBool>,
+    }
+    struct FakeStep(Probe, Option<bool>, bool, Instant);
+    impl Running for FakeStep {
+        fn poll(&mut self) -> Result<Option<bool>, String> {
+            if Instant::now() < self.3 {
+                return Ok(None);
+            }
+            self.2 = self.1.is_some();
+            Ok(self.1)
         }
-        let mut callbacks = 0;
-        assert_eq!(
-            consume_progress(&mut &b"OK /nix/store/test-system\n"[..], system, || {
-                callbacks += 1;
-                Ok(())
-            })
-            .unwrap(),
-            "OK /nix/store/test-system"
+    }
+    impl Drop for FakeStep {
+        fn drop(&mut self) {
+            if !self.2 {
+                self.0.stopped.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+    impl Probe {
+        fn starter(&self, outcome: Option<bool>) -> impl FnMut() -> Result<Option<Box<dyn Running>>, String> {
+            self.delayed(outcome, Duration::ZERO)
+        }
+        fn delayed(&self, outcome: Option<bool>, delay: Duration) -> impl FnMut() -> Result<Option<Box<dyn Running>>, String> {
+            let probe = self.clone();
+            move || {
+                probe.started.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(Box::new(FakeStep(probe.clone(), outcome, false, Instant::now() + delay)) as Box<dyn Running>))
+            }
+        }
+    }
+
+    fn feed(lines: &[&str], end: bool) -> mpsc::Receiver<Result<String, String>> {
+        let (sender, receiver) = mpsc::channel();
+        for line in lines {
+            sender.send(Ok(line.to_string())).unwrap();
+        }
+        if end {
+            sender.send(Err("reading control header: failed to fill whole buffer".into())).unwrap();
+        } else {
+            std::mem::forget(sender);
+        }
+        receiver
+    }
+
+    fn drive(lines: &[&str], end: bool, outcome: Option<bool>) -> (Result<(), String>, Probe, Vec<String>) {
+        let probe = Probe::default();
+        let mut reports = Vec::new();
+        let result = follow(
+            &feed(lines, end),
+            Path::new("/nix/store/test-system"),
+            &mut probe.starter(outcome),
+            &mut |message| reports.push(message.to_owned()),
+            Duration::from_millis(300),
         );
-        assert_eq!(callbacks, 0); // apply owns legacy completion callback.
+        (result, probe, reports)
+    }
+
+    #[test]
+    fn the_secret_step_stops_when_the_failure_arrives_not_with_the_verdict() {
+        let (sender, lines) = mpsc::channel();
+        let probe = Probe::default();
+        let watched = probe.clone();
+        let follower = std::thread::spawn(move || {
+            follow(
+                &lines,
+                Path::new("/nix/store/test-system"),
+                &mut watched.starter(None),
+                &mut |_| {},
+                SILENCE_LIMIT,
+            )
+        });
+        sender.send(Ok("ACTIVATED /nix/store/test-system".to_owned())).unwrap();
+        sender.send(Ok("FAILED status 4".to_owned())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !probe.stopped.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(probe.stopped.load(Ordering::SeqCst), "the secret step outlived the failure");
+        sender.send(Ok("ROLLED-BACK status 4".to_owned())).unwrap();
+        assert!(follower.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn host_failure_stops_the_secret_step_and_reports_before_the_verdict() {
+        let (result, probe, reports) = drive(
+            &[
+                "ACTIVATED /nix/store/test-system",
+                "FAILED switch-to-configuration test exited with status 4",
+                "WAITING switch-to-configuration test",
+                "ROLLED-BACK status 4; previous system /nix/store/old restored and verified",
+            ],
+            false,
+            None,
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("rolled back"), "{error}");
+        assert!(error.contains("restored and verified"), "{error}");
+        assert_eq!(probe.started.load(Ordering::SeqCst), 1);
+        assert!(probe.stopped.load(Ordering::SeqCst), "the secret step kept running");
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].contains("rolling back: switch-to-configuration test exited with status 4"));
+    }
+
+    #[test]
+    fn rejected_or_failed_updates_never_start_the_secret_step() {
+        for lines in [
+            &["REJECTED closure lacks a signature by a trusted update key"][..],
+            &["ERR update rejected"][..],
+            &["FAILED x", "ACTIVATED /nix/store/test-system", "ROLLBACK-FAILED x; sshd is not listening"][..],
+        ] {
+            let (result, probe, _) = drive(lines, false, Some(true));
+            assert!(result.is_err(), "{lines:?}");
+            assert_eq!(probe.started.load(Ordering::SeqCst), 0, "{lines:?}");
+        }
+        let (result, _, _) = drive(&["REJECTED bad signature"], false, None);
+        assert!(result.unwrap_err().contains("host is unchanged: bad signature"));
+        let (result, _, _) = drive(&["FAILED x", "ACTIVATED /nix/store/test-system", "ROLLBACK-FAILED y"], false, None);
+        assert!(result.unwrap_err().contains("ROLLING BACK FAILED"));
+    }
+
+    #[test]
+    fn lost_connection_mid_switch_stops_the_secret_step_and_fails() {
+        let (result, probe, _) = drive(&["ACTIVATED /nix/store/test-system"], true, None);
+        let error = result.unwrap_err();
+        assert!(error.contains("lost the update connection"), "{error}");
+        assert!(error.contains("rolls it back by itself"), "{error}");
+        assert!(probe.stopped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn success_needs_the_verdict_and_the_secret_step() {
+        let (result, probe, _) = drive(&["ACTIVATED /nix/store/test-system", "OK /nix/store/test-system"], false, Some(true));
+        assert_eq!(result, Ok(()));
+        assert_eq!(probe.started.load(Ordering::SeqCst), 1);
+        let (result, _, reports) = drive(&["ACTIVATED /nix/store/test-system", "OK /nix/store/test-system"], false, Some(false));
+        assert!(result.is_err());
+        assert_eq!(reports.len(), 1, "a failed secret step is reported at once");
+        // Legacy brokers send only their receipt; the callback runs once.
+        let (result, probe, _) = drive(&["OK /nix/store/test-system"], false, Some(true));
+        assert_eq!(result, Ok(()));
+        assert_eq!(probe.started.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn invalid_progress_is_rejected_and_silence_times_out() {
+        for lines in [
+            &["ACTIVATED /nix/store/wrong"][..],
+            &["ACTIVATED /nix/store/test-system", "ACTIVATED /nix/store/test-system"][..],
+            &["FAILED a", "FAILED b"][..],
+            &["FAILED a", "OK /nix/store/test-system"][..],
+            &["OK /nix/store/wrong"][..],
+            &["SOMETHING"][..],
+        ] {
+            assert!(drive(lines, false, Some(true)).0.is_err(), "{lines:?}");
+        }
+        let (result, _, _) = drive(&[], false, None);
+        assert!(result.unwrap_err().contains("no progress"));
+        // A running secret step is not silence: the deployment may wait for
+        // its operator longer than the limit.
+        let (sender, lines) = mpsc::channel();
+        sender.send(Ok("ACTIVATED /nix/store/test-system".to_owned())).unwrap();
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            sender.send(Ok("OK /nix/store/test-system".to_owned())).unwrap();
+        });
+        let probe = Probe::default();
+        let result = follow(
+            &lines,
+            Path::new("/nix/store/test-system"),
+            &mut probe.delayed(Some(true), Duration::from_millis(600)),
+            &mut |_| {},
+            Duration::from_millis(300),
+        );
+        assert_eq!(result, Ok(()));
+        late.join().unwrap();
     }
 
     #[test]

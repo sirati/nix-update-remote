@@ -31,6 +31,9 @@
         integration = nixpkgs.legacyPackages.x86_64-linux.testers.runNixOSTest (
           import ./tests/nixos.nix { pkgs = nixpkgs.legacyPackages.x86_64-linux; }
         );
+        rollback = nixpkgs.legacyPackages.x86_64-linux.testers.runNixOSTest (
+          import ./tests/rollback.nix { pkgs = nixpkgs.legacyPackages.x86_64-linux; }
+        );
       };
     };
 }

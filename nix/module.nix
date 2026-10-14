@@ -63,6 +63,33 @@ in
         description = "Immutable signature verifier executable supplied by the artifact integration.";
       };
     };
+    health = {
+      units = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "lifecycle-health-app.service" ];
+        description = ''
+          Units that must start successfully after a switch. Units that already
+          failed before the update do not block it.
+        '';
+      };
+      settleSeconds = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 10;
+        description = "How long after a switch units may still fail before the new system counts as healthy.";
+      };
+      timeoutSeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 600;
+        description = "How long health units and repair restarts may take.";
+      };
+      sshPorts = lib.mkOption {
+        type = lib.types.listOf lib.types.port;
+        default = lib.optionals config.services.openssh.enable config.services.openssh.ports;
+        defaultText = lib.literalExpression "config.services.openssh.ports when OpenSSH is enabled";
+        description = "Ports on which sshd must listen after a switch and after a rollback.";
+      };
+    };
     reportQueue = lib.mkOption {
       type = lib.types.str;
       default = "/persistent/system-update-reports";
@@ -177,6 +204,9 @@ in
         Group = cfg.user;
         UMask = "0007";
         Restart = "on-failure";
+        # The journal of an unfinished switch; the next start rolls it back.
+        StateDirectory = "nix-update-remote";
+        StateDirectoryMode = "0700";
         ExecStart = lib.escapeShellArgs (
           [
             updaterExe
@@ -188,6 +218,10 @@ in
             "--update-uid"
             (toString cfg.uid)
             "--report-queue" cfg.reportQueue
+            "--systemctl" "${config.systemd.package}/bin/systemctl"
+            "--state-dir" "/var/lib/nix-update-remote"
+            "--health-settle-seconds" (toString cfg.health.settleSeconds)
+            "--health-timeout-seconds" (toString cfg.health.timeoutSeconds)
             "--restart-command" "${pkgs.systemd}/bin/systemctl"
             "--restart-arg" "try-restart"
             "--restart-arg" "--no-block"
@@ -198,6 +232,8 @@ in
             ++ lib.concatMap (arg: [ "--artifact-prepare-arg" arg ]) ([ "prepare-erofs" ] ++ artifactArgs)
             ++ lib.concatMap (arg: [ "--artifact-activate-arg" arg ]) ([ "activate-erofs" ] ++ artifactArgs)
           )
+          ++ lib.concatMap (unit: [ "--health-unit" unit ]) cfg.health.units
+          ++ lib.concatMap (port: [ "--ssh-port" (toString port) ]) cfg.health.sshPorts
           ++ lib.concatMap (key: [ "--trusted-key" key ]) cfg.trustedPublicKeys
           ++ lib.optionals (cfg.trustedPublicKeysFile != null) [
             "--trusted-key-file"

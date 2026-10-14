@@ -141,7 +141,7 @@ pub fn deliver(args: &[String]) -> Result<(), String> {
         if fields.len() != 5
             || fields[0] != "NIX_UPDATE_REPORT_1"
             || !matches!(fields[1], "before" | "after")
-            || !matches!(fields[2], "pending" | "success" | "failure")
+            || !matches!(fields[2], "pending" | "success" | "failure" | "rolled-back" | "rollback-failed")
             || fields[4].parse::<u64>().is_err()
         {
             return Err("invalid queued report content".into());

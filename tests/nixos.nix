@@ -338,9 +338,13 @@ in
     machine.succeed(f"nix --extra-experimental-features nix-command store sign -r --key-file /run/update-signing-b {failed}")
     client.succeed(f"NIX_SSHOPTS='{nix_ssh_b}' nix --extra-experimental-features nix-command --option trusted-public-keys {shlex.quote(trusted_copy_key)} copy --from ssh-ng://update@machine {failed}")
     retry_command = f"cd /root && NIX_SSHOPTS='{nix_ssh_b}' ${updater}/bin/nix-update-remote deploy --ssh-arg -o --ssh-arg BatchMode=yes --target update@machine --key-command ${pkgs.coreutils}/bin/cat --key-arg /root/client-update-key --installable"
-    client.fail(f"{retry_command} {failed}")
-    machine.succeed("grep -Fx failed /etc/remote-update-generation")
-    machine.wait_until_succeeds("grep -zq UPDATE_TEST_GENERATION=failed /proc/$(systemctl show nix-update-remote.service -p MainPID --value)/environ")
+    # A unit failing on start rolls the whole update back; the broker
+    # keeps running the restored generation.
+    output = client.fail(f"{retry_command} {failed} 2>&1")
+    assert "rolled back" in output and "activation-failure.service" in output, output
+    machine.succeed("grep -Fx gated /etc/remote-update-generation")
+    machine.succeed(f"test $(readlink /run/current-system) = {gated}")
+    machine.fail("grep -zq UPDATE_TEST_GENERATION=failed /proc/$(systemctl show nix-update-remote.service -p MainPID --value)/environ")
     client.succeed(f"{retry_command} {second}")
     machine.succeed("grep -Fx second /etc/remote-update-generation")
     machine.wait_until_succeeds("grep -zq UPDATE_TEST_GENERATION=second /proc/$(systemctl show nix-update-remote.service -p MainPID --value)/environ")

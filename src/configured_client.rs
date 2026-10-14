@@ -18,6 +18,10 @@ struct Plan {
     /// see `--login-approval-command`. Empty: none.
     #[serde(default)]
     login_approval_command: Vec<String>,
+    /// Reports a failed update to the operator as soon as it is known; the
+    /// reason is appended as the last argument. Empty: none.
+    #[serde(default)]
+    failure_command: Vec<String>,
     ssh_arguments: Vec<String>,
     copy_ssh_arguments: Vec<String>,
     reboot: bool,
@@ -34,6 +38,14 @@ fn expanded(values: &[String], replacements: &BTreeMap<&str, String>) -> Vec<Str
 }
 // Nix parses NIX_SSHOPTS as shell words, but never executes this string.
 fn quote(value: &str) -> String { format!("'{}'", value.replace('\'', "'\\''")) }
+/// The backend options that report a failed update through the plan's reporter.
+fn reporter_arguments(command: &[String], replacements: &BTreeMap<&str, String>) -> Vec<String> {
+    let command = expanded(command, replacements);
+    let Some((program, arguments)) = command.split_first() else { return Vec::new() };
+    let mut options = vec!["--failure-command".to_owned(), program.clone()];
+    for argument in arguments { options.extend(["--failure-arg".to_owned(), argument.clone()]); }
+    options
+}
 struct PublicKey(std::path::PathBuf);
 impl Drop for PublicKey { fn drop(&mut self) { let _ = fs::remove_file(&self.0); if let Some(parent) = self.0.parent() { let _ = fs::remove_dir(parent); } } }
 pub fn deploy(args: &[String]) -> Result<(), String> {
@@ -109,6 +121,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
         child.arg("--login-approval-command").arg(program);
         for argument in arguments { child.arg("--login-approval-arg").arg(argument); }
     }
+    child.args(reporter_arguments(&plan.failure_command, &replacements));
     for argument in ssh_arguments { child.arg("--ssh-arg").arg(argument); }
     if plan.reboot && !no_reboot { child.arg("--reboot"); }
     child.env("NIX_SSHOPTS", copy_arguments.iter().map(|v| quote(v)).collect::<Vec<_>>().join(" "));
@@ -122,5 +135,15 @@ mod tests {
         let map = BTreeMap::from([("{target}", "update@::1".to_owned())]);
         assert_eq!(expanded(&["--destination".into(), "{target}".into()], &map), ["--destination", "update@::1"]);
         assert_eq!(quote("a'b"), "'a'\\''b'");
+    }
+    #[test]
+    fn the_failure_reporter_reaches_the_backend_with_the_host_substituted() {
+        let map = BTreeMap::from([("{host}", "ns1".to_owned())]);
+        let plan = ["/nix-secrets".to_owned(), "procedure-step-failed".into(), "--label".into(), "update {host}".into(), "--reason".into()];
+        assert_eq!(
+            reporter_arguments(&plan, &map),
+            ["--failure-command", "/nix-secrets", "--failure-arg", "procedure-step-failed", "--failure-arg", "--label", "--failure-arg", "update ns1", "--failure-arg", "--reason"]
+        );
+        assert!(reporter_arguments(&[], &map).is_empty());
     }
 }
