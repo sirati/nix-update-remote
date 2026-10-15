@@ -65,7 +65,9 @@ impl Drop for PublicKey { fn drop(&mut self) { let _ = fs::remove_file(&self.0);
 /// The operator's options, or `None` for `--help`. A wrapper fixes some of
 /// them and appends the operator's own; a second copy of any is refused, so
 /// none replaces the wrapper's.
-fn parse(args: &[String]) -> Result<Option<(BTreeMap<&str, String>, bool)>, String> {
+/// Option values by name, and whether `--no-reboot` was given.
+type Given<'a> = (BTreeMap<&'a str, String>, bool);
+fn parse(args: &[String]) -> Result<Option<Given<'_>>, String> {
     let mut values = BTreeMap::new();
     let mut no_reboot = false;
     let mut once = crate::options::Once::default();

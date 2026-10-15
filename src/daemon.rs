@@ -656,10 +656,11 @@ fn switch_marked(
         mark_pending(&options.commit_units_pending, resolved)?;
     }
     let outcome = transaction::update(host, resolved, events);
-    if !matches!(outcome, Ok(Outcome::Committed { .. })) && !options.commit_units.is_empty() {
-        if let Err(error) = clear_pending(&options.commit_units_pending) {
-            eprintln!("nix-update-remote: {error}");
-        }
+    if !matches!(outcome, Ok(Outcome::Committed { .. }))
+        && !options.commit_units.is_empty()
+        && let Err(error) = clear_pending(&options.commit_units_pending)
+    {
+        eprintln!("nix-update-remote: {error}");
     }
     outcome
 }
