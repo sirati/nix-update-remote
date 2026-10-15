@@ -30,6 +30,9 @@ struct Options {
     restart_args: Vec<String>,
     systemctl: Option<PathBuf>,
     state_dir: PathBuf,
+    /// Where the phase of a transaction in progress is published to the
+    /// update account.
+    phase_file: PathBuf,
     ssh_ports: Vec<u16>,
     health_units: Vec<String>,
     health_settle: Duration,
@@ -45,6 +48,7 @@ impl Options {
             profile: &self.profile,
             systemctl: self.systemctl.as_deref().ok_or("missing --systemctl")?,
             state_dir: &self.state_dir,
+            phase_file: &self.phase_file,
             ssh_ports: &self.ssh_ports,
             health_units: &self.health_units,
             settle: self.health_settle,
@@ -105,6 +109,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
         if let Some((journal, outcome)) = transaction::recover(&mut host, &mut LogEvents) {
             let result = report_outcome(&outcome);
             record_event(&options, &journal.new_system, "after", result);
+        }
+        if let Err(error) = host.republish_phase() {
+            eprintln!("nix-update-remote: {error}");
         }
     }
     // The rollback may have left a system with another updater.
@@ -295,6 +302,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut artifact_activate_args = Vec::new();
     let mut systemctl = None;
     let mut state_dir = PathBuf::from("/var/lib/nix-update-remote");
+    let phase_file = PathBuf::from(protocol::PHASE_FILE);
     let mut ssh_ports = Vec::new();
     let mut health_units = Vec::new();
     let mut health_settle = Duration::from_secs(10);
@@ -440,6 +448,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         restart_args,
         systemctl,
         state_dir,
+        phase_file,
         ssh_ports,
         health_units,
         health_settle,

@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 
 pub const MAGIC: &str = "NIX_UPDATE_REMOTE_1";
 pub const SOCKET: &str = "/run/nix-update-remote/control.sock";
+/// The phase of the transaction in progress, the only part of the root-only
+/// journal the update account reads; absent while none is.
+pub const PHASE_FILE: &str = "/run/nix-update-remote/transaction-phase";
 pub const MAX_REQUEST: u64 = 4096;
 
 pub fn request(system: &Path) -> String {

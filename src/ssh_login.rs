@@ -22,6 +22,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
             println!("{}", path.display());
             Ok(())
         }
+        [command] if command == "transaction-phase" => {
+            println!("{}", transaction_phase(Path::new(protocol::PHASE_FILE))?);
+            Ok(())
+        }
         [command] if command == "ping" => {
             println!("{}", ping(Path::new(protocol::SOCKET), RETRY_LIMIT)?);
             Ok(())
@@ -63,6 +67,20 @@ fn committed_system(current: &Path, profile: &Path) -> Result<std::path::PathBuf
         return Err("the running system is not the committed system profile".into());
     }
     Ok(running)
+}
+
+/// The phase of the broker's transaction in progress, `idle` without one.
+/// The broker publishes only this word of its root-only journal.
+fn transaction_phase(published: &Path) -> Result<&'static str, String> {
+    match std::fs::read(published) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok("idle"),
+        Err(error) => Err(format!("cannot read the update phase: {error}")),
+        Ok(bytes) => match bytes.as_slice() {
+            b"activating\n" => Ok("activating"),
+            b"committing\n" => Ok("committing"),
+            _ => Err("the published update phase is invalid".into()),
+        },
+    }
 }
 
 /// Asks the broker for its version, through the same socket and peer check
@@ -466,6 +484,32 @@ mod probe_tests {
         std::fs::remove_file(&link).unwrap();
         symlink(&b, &link).unwrap();
         assert!(committed_system(&current, &profile).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod phase_tests {
+    use super::*;
+
+    #[test]
+    fn the_login_answers_only_the_published_phase() {
+        let dir = std::env::temp_dir().join(format!("nur-phase-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let published = dir.join("transaction-phase");
+        assert_eq!(transaction_phase(&published), Ok("idle"));
+        for phase in ["activating", "committing"] {
+            std::fs::write(&published, format!("{phase}\n")).unwrap();
+            assert_eq!(transaction_phase(&published), Ok(phase));
+        }
+        // Anything else is no answer, never `idle`, and is not echoed.
+        std::fs::write(&published, "{\"boot_id\":\"secret\"}\n").unwrap();
+        let error = transaction_phase(&published).unwrap_err();
+        assert!(!error.contains("secret"), "{error}");
+        std::fs::remove_file(&published).unwrap();
+        std::fs::create_dir(&published).unwrap();
+        assert!(transaction_phase(&published).is_err(), "an unreadable phase is no answer");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -40,6 +40,8 @@ pub struct SystemHost<'a> {
     pub profile: &'a Path,
     pub systemctl: &'a Path,
     pub state_dir: &'a Path,
+    /// Where the journal's phase is published to the update account.
+    pub phase_file: &'a Path,
     pub ssh_ports: &'a [u16],
     pub health_units: &'a [String],
     pub settle: Duration,
@@ -49,6 +51,39 @@ pub struct SystemHost<'a> {
 impl SystemHost<'_> {
     fn journal_path(&self) -> PathBuf {
         self.state_dir.join("transaction.json")
+    }
+
+    /// Makes the published phase match the journal again, after a daemon
+    /// that stopped between the two.
+    pub fn republish_phase(&self) -> Result<(), String> {
+        self.publish_phase(self.read_journal()?.map(|journal| journal.phase))
+    }
+
+    /// Publishes the phase of the journal, and nothing else of it, to the
+    /// update account, which may not read the journal; `None` removes it.
+    fn publish_phase(&self, phase: Option<crate::transaction::Phase>) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(phase) = phase else {
+            return match fs::remove_file(self.phase_file) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    Err(format!("removing {}: {error}", self.phase_file.display()))
+                }
+                _ => Ok(()),
+            };
+        };
+        let temporary = self.phase_file.with_extension("new");
+        let error = |e: std::io::Error| format!("publishing the update phase in {}: {e}", self.phase_file.display());
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o640)
+            .open(&temporary)
+            .map_err(error)?;
+        // Readable, never writable, by the update group.
+        file.set_permissions(fs::Permissions::from_mode(0o640)).map_err(error)?;
+        file.write_all(format!("{}\n", phase.word()).as_bytes()).map_err(error)?;
+        fs::rename(&temporary, self.phase_file).map_err(error)
     }
 
     fn systemctl_lines(&self, args: &[&str]) -> Result<Vec<String>, String> {
@@ -419,7 +454,8 @@ impl Host for SystemHost<'_> {
         fs::rename(&temporary, &path).map_err(|e| e.to_string())?;
         fs::File::open(self.state_dir)
             .and_then(|dir| dir.sync_all())
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        self.publish_phase(Some(journal.phase))
     }
 
     fn read_journal(&self) -> Result<Option<Journal>, String> {
@@ -436,7 +472,8 @@ impl Host for SystemHost<'_> {
             _ => fs::File::open(self.state_dir)
                 .and_then(|dir| dir.sync_all())
                 .or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
-                .map_err(|e| e.to_string()),
+                .map_err(|e| e.to_string())
+                .and_then(|()| self.publish_phase(None)),
         }
     }
 }
@@ -483,6 +520,7 @@ mod tests {
             profile: &profile,
             systemctl: Path::new("/nonexistent"),
             state_dir: &state,
+            phase_file: &directory.join("transaction-phase"),
             ssh_ports: &[],
             health_units: &[],
             settle: Duration::ZERO,
@@ -497,8 +535,19 @@ mod tests {
             failed_before: BTreeSet::new(),
             running_before: BTreeSet::from(["sshd.service".to_owned()]),
         };
+        let phase = directory.join("transaction-phase");
+        host.write_journal(&Journal { phase: crate::transaction::Phase::Activating, ..journal.clone() }).unwrap();
+        assert_eq!(fs::read_to_string(&phase).unwrap(), "activating\n");
         host.write_journal(&journal).unwrap();
         assert_eq!(host.read_journal().unwrap(), Some(journal));
+        // The update account reads the phase and nothing else of the journal.
+        assert_eq!(fs::read_to_string(&phase).unwrap(), "committing\n");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&phase).unwrap().permissions().mode() & 0o777, 0o640);
+        assert_eq!(fs::metadata(state.join("transaction.json")).unwrap().permissions().mode() & 0o077, 0);
+        fs::remove_file(&phase).unwrap();
+        host.republish_phase().unwrap();
+        assert_eq!(fs::read_to_string(&phase).unwrap(), "committing\n", "a lost phase is published again");
         fs::remove_file(&profile).unwrap();
         symlink("system-2-link", &profile).unwrap();
         host.restore_profile(Some(Path::new("system-1-link"))).unwrap();
@@ -507,6 +556,10 @@ mod tests {
         assert!(fs::symlink_metadata(&profile).is_err());
         host.clear_journal().unwrap();
         assert_eq!(host.read_journal().unwrap(), None);
+        assert!(!phase.exists(), "no phase without a transaction");
+        fs::write(&phase, "committing\n").unwrap();
+        host.republish_phase().unwrap();
+        assert!(!phase.exists(), "a stale phase is removed");
         fs::remove_dir_all(&directory).unwrap();
     }
 }

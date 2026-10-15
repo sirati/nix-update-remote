@@ -23,6 +23,16 @@ pub enum Phase {
     Committing,
 }
 
+impl Phase {
+    /// The word the update account may read: `transaction-phase` answers it.
+    pub fn word(self) -> &'static str {
+        match self {
+            Phase::Activating => "activating",
+            Phase::Committing => "committing",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Journal {

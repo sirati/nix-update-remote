@@ -79,7 +79,9 @@ An update that committed but whose secret deployment failed ends with
 "update committed, secrets NOT deployed". Running the same update again finds,
 through the login program's `committed-system`, that the host already runs
 and has committed that system, skips the copy and the switch, and deploys only
-the secrets.
+the secrets. It refuses to do so while the login program's `transaction-phase`
+reports another update `activating` or `committing`: the broker publishes only
+that word of its root-only journal in `/run/nix-update-remote/transaction-phase`.
 
 `configured-deploy` checks the git tree of a local flake before anything is
 signed. When tracked files have uncommitted changes, it names them in a red

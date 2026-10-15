@@ -103,7 +103,13 @@ fn deploy_with(options: &Options) -> Result<(), String> {
         options.progress_command.clone(),
         options.progress_args.clone(),
     );
-    if committed_system(&transport).as_deref() == Some(system.as_path()) {
+    let resume = resume_secrets_only(
+        committed_system(&transport).as_deref(),
+        transaction_phase(&transport).as_deref(),
+        &system,
+        &options.target,
+    )?;
+    if resume {
         // An earlier run committed this system, and its secret deployment
         // may have failed: resume with that step alone.
         progress.report(
@@ -745,6 +751,47 @@ fn committed_system(transport: &Transport) -> Option<PathBuf> {
         .then(|| PathBuf::from(path))
 }
 
+/// The phase of the host's transaction in progress (`idle` without one),
+/// from its login helper; `None` when it cannot be told.
+fn transaction_phase(transport: &Transport) -> Option<String> {
+    let output = Command::new("ssh")
+        .args(transport.channel_args())
+        .args(["--", &transport.target, "transaction-phase"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .managed_output()
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    let phase = text.strip_suffix('\n')?;
+    (output.status.success() && matches!(phase, "idle" | "activating" | "committing"))
+        .then(|| phase.to_owned())
+}
+
+/// Whether the host already committed `system` and only its secrets remain.
+/// Another update in progress may still replace or roll back that system,
+/// so the secrets are not deployed alone meanwhile. When no phase can be
+/// told, the update runs in full: the broker serializes it after any other.
+fn resume_secrets_only(
+    committed: Option<&Path>,
+    phase: Option<&str>,
+    system: &Path,
+    target: &str,
+) -> Result<bool, String> {
+    if committed != Some(system) {
+        return Ok(false);
+    }
+    match phase {
+        Some("idle") => Ok(true),
+        Some(phase @ ("activating" | "committing")) => Err(format!(
+            "{target} already runs {}, but another update is {phase} on it right now; its secrets \
+             are not deployed while that update may still replace the system. Wait for it to \
+             finish and run this update again",
+            system.display()
+        )),
+        _ => Ok(false),
+    }
+}
+
 /// What the operator must read when the host committed `system` but the
 /// secret deployment did not finish.
 fn secrets_not_deployed(system: &Path) -> String {
@@ -1132,6 +1179,24 @@ mod tests {
         assert!(error.contains("update committed, secrets NOT deployed"), "{error}");
         // Without a secret step there is nothing left to do.
         assert_eq!(secrets_only(&mut || Ok(None), system), Ok(()));
+    }
+
+    #[test]
+    fn secrets_are_not_resumed_while_another_update_is_in_progress() {
+        let system = Path::new("/nix/store/test-system");
+        let resume = |committed: Option<&str>, phase: Option<&str>| {
+            resume_secrets_only(committed.map(Path::new), phase, system, "update@ns1")
+        };
+        assert_eq!(resume(Some("/nix/store/test-system"), Some("idle")), Ok(true));
+        for phase in ["committing", "activating"] {
+            let error = resume(Some("/nix/store/test-system"), Some(phase)).unwrap_err();
+            assert!(error.contains(&format!("another update is {phase}")) && error.contains("update@ns1"), "{error}");
+        }
+        // No answer: the full update, which the broker serializes.
+        assert_eq!(resume(Some("/nix/store/test-system"), None), Ok(false));
+        assert_eq!(resume(Some("/nix/store/test-system"), Some("bogus")), Ok(false));
+        assert_eq!(resume(Some("/nix/store/other"), Some("committing")), Ok(false));
+        assert_eq!(resume(None, Some("idle")), Ok(false));
     }
 
     #[test]
