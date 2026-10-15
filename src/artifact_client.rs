@@ -130,8 +130,10 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     let mut post_args = Vec::new();
     let mut wait_system = None;
     let mut login_approval = crate::login_approval::LoginApproval::default();
+    let mut once = crate::options::Once::default();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
+        once.take(arg, &["--remote-arg", "--post-arg", "--sign-arg", "--key-arg", "--ssh-arg", "--login-approval-arg"])?;
         if login_approval.parse(arg, &mut iter)? {
             continue;
         }

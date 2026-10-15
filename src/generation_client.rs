@@ -129,6 +129,7 @@ fn failure_reporter(args: &[String]) -> Result<(Vec<String>, Option<(PathBuf, Ve
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--impure" | "--reboot" => rest.push(arg.clone()),
+            "--failure-command" if command.is_some() => return Err("option --failure-command is given more than once".into()),
             "--failure-command" => command = Some(PathBuf::from(iter.next().ok_or("missing failure command")?)),
             "--failure-arg" => reporter_args.push(iter.next().ok_or("missing failure argument")?.clone()),
             _ => {
@@ -184,8 +185,10 @@ fn deploy_generation(args: &[String]) -> Result<(), String> {
     let mut tools_enabled_attribute = None;
     let mut reboot = false;
     let mut external_signing = false;
+    let mut once = crate::options::Once::default();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
+        once.take(arg, &["--sign-arg", "--key-arg", "--ssh-arg", "--post-arg", "--remote-arg", "--login-approval-arg"])?;
         match arg.as_str() {
             "--image-attribute" | "--config-attribute" | "--rescue-attribute"
             | "--signer-attribute" | "--system-attribute" => {
@@ -339,5 +342,30 @@ mod tests {
         for bad in ["", "system.build.", ".x", "a.b\"c", "a.${x}", "a.b c"] {
             assert!(presence_probe(bad).is_err(), "{bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod repeat_tests {
+    use super::*;
+
+    #[test]
+    fn a_generation_option_given_twice_is_refused_before_any_build() {
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for list in [
+            &["--installable", ".#a", "--installable", "path:/tmp/evil#a"][..],
+            &["--nix", "/nonexistent/a", "--nix", "/nonexistent/b", "--installable", ".#a"],
+            &["--target", "update@a", "--target", "update@b", "--installable", ".#a"],
+            &["--image-attribute", "x", "--image-attribute", "y", "--installable", ".#a"],
+        ] {
+            assert!(deploy_generation(&args(list)).unwrap_err().contains("more than once"), "{list:?}");
+        }
+        assert!(failure_reporter(&args(&["--failure-command", "/a", "--failure-command", "/b"])).is_err());
+    }
+
+    #[test]
+    fn an_artifact_option_given_twice_is_refused() {
+        let args = ["--target", "update@a", "--target", "update@b"].map(String::from);
+        assert!(crate::artifact_client::deploy(&args).unwrap_err().contains("more than once"));
     }
 }

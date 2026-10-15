@@ -203,6 +203,12 @@ impl Drop for Roots {
     }
 }
 
+/// Options that add to a list; any other given twice is refused.
+const REPEATABLE: &[&str] = &[
+    "--key-arg", "--sign-arg", "--ssh-arg", "--activation-arg", "--post-arg", "--failure-arg",
+    "--warning-arg", "--progress-arg", "--reuse-signatures-by", "--login-approval-arg",
+];
+
 fn parse(args: &[String]) -> Result<Options, String> {
     let mut target = None;
     let mut installable = None;
@@ -225,8 +231,10 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut progress_args = Vec::new();
     let mut reuse_signature_keys = Vec::new();
     let mut login_approval = crate::login_approval::LoginApproval::default();
+    let mut once = crate::options::Once::default();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
+        once.take(arg, REPEATABLE)?;
         if login_approval.parse(arg, &mut iter)? {
             continue;
         }
@@ -1207,6 +1215,24 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_backend_option_given_twice_is_refused() {
+        let base = ["--target", "update@example.org", "--installable", ".#host", "--sign-command", "/s", "--sign-arg", "a", "--sign-arg", "b"];
+        let args = |extra: &[&str]| base.iter().chain(extra).map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(parse(&args(&["--ssh-arg", "-v", "--ssh-arg", "-v"])).is_ok(), "list options add up");
+        for extra in [
+            &["--target", "update@evil.example"][..],
+            &["--installable", "path:/tmp/evil#host"],
+            &["--sign-command", "/evil"],
+            &["--impure", "--impure"],
+            &["--activation-command", "/a", "--activation-command", "/b"],
+            &["--failure-command", "/a", "--failure-command", "/b"],
+            &["--login-approval-command", "/a", "--login-approval-command", "/b"],
+        ] {
+            assert!(parse(&args(extra)).err().unwrap().contains("more than once"), "{extra:?}");
+        }
     }
 
     #[test]

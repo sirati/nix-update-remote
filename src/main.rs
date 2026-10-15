@@ -15,6 +15,7 @@ mod system_host;
 mod transaction;
 mod generation_client;
 mod progress;
+mod options;
 mod protocol;
 mod report_queue;
 mod ssh_login;
