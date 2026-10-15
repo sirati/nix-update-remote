@@ -11,6 +11,7 @@ mod configured_client;
 mod keygen;
 mod login_approval;
 mod daemon;
+mod switch_lock;
 mod system_host;
 mod transaction;
 mod generation_client;

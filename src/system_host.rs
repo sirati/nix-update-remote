@@ -343,27 +343,8 @@ impl Host for SystemHost<'_> {
     }
 
     fn wait_switch_lock(&mut self, events: &mut dyn Events) -> Result<(), String> {
-        let start = Instant::now();
-        let mut last = start;
-        loop {
-            let file = match fs::File::open(SWITCH_LOCK) {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(error) => return Err(format!("opening {SWITCH_LOCK}: {error}")),
-            };
-            if rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok() {
-                // Closing the file releases the lock for our own switch.
-                return Ok(());
-            }
-            if start.elapsed() >= LOCK_WAIT {
-                return Err("another switch-to-configuration is still running".into());
-            }
-            if last.elapsed() >= KEEPALIVE {
-                events.waiting("waiting for another switch-to-configuration");
-                last = Instant::now();
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
+        let poll = Duration::from_millis(500);
+        crate::switch_lock::wait_released(Path::new(SWITCH_LOCK), LOCK_WAIT, poll, KEEPALIVE, events)
     }
 
     fn failed_units(&self) -> Result<BTreeSet<String>, String> {
