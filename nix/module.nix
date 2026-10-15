@@ -98,7 +98,20 @@ in
         Units the broker starts, without waiting for them, after each
         committed closure update: checks of what the commit installed. Their
         result never changes the update's outcome; a failing one reports
-        through its own unit state.
+        through its own unit state. A commit whose units did not start, for
+        instance because the host rebooted first, starts them when the broker
+        next starts, typically at the next boot.
+      '';
+    };
+    commitUnitsPendingFile = lib.mkOption {
+      type = lib.types.strMatching "/.*";
+      default = "/nix/var/nix-update-remote/commit-units-pending";
+      description = ''
+        Root-only record of a committed system whose `commitUnits` have not
+        started yet. It must survive a reboot whenever the system profile
+        does; the default sits next to that profile in `/nix/var`, which
+        impermanence hosts keep. `/var/lib/nix-update-remote` would not do
+        on such hosts.
       '';
     };
     probe = {
@@ -169,6 +182,10 @@ in
       {
         assertion = lib.all (lib.hasPrefix "/nix/store/") (cfg.beforeHooks ++ cfg.afterHooks);
         message = "remoteUpdate hooks must be absolute Nix store executables.";
+      }
+      {
+        assertion = !(lib.hasPrefix "/nix/store/" cfg.commitUnitsPendingFile);
+        message = "services.nixUpdateRemote.commitUnitsPendingFile must be a mutable path.";
       }
       {
         # The broker runs `switch-to-configuration boot` for commits and
@@ -275,6 +292,7 @@ in
           )
           ++ lib.concatMap (unit: [ "--health-unit" unit ]) cfg.health.units
           ++ lib.concatMap (unit: [ "--commit-unit" unit ]) cfg.commitUnits
+          ++ lib.optionals (cfg.commitUnits != [ ]) [ "--commit-units-pending" cfg.commitUnitsPendingFile ]
           ++ lib.concatMap (port: [ "--ssh-port" (toString port) ]) cfg.health.sshPorts
           ++ lib.concatMap (key: [ "--trusted-key" key ]) cfg.trustedPublicKeys
           ++ lib.optionals (cfg.trustedPublicKeysFile != null) [

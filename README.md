@@ -94,7 +94,10 @@ version through the control socket and the same peer check as an update, so
 `nix-update-remote-probe.service` fails when the broker is down, refuses the
 login program, or runs another updater than the current system's.
 `services.nixUpdateRemote.commitUnits` lists units the broker starts after each
-committed closure update, such as checks of what the commit installed.
+committed closure update, such as checks of what the commit installed. They
+are marked pending in `commitUnitsPendingFile` before the switch; a commit
+whose units never started, because the host rebooted or the broker stopped
+first, starts them when the broker next starts on that system.
 
 The integration VM tests the restricted SSH account, validation on both sides,
 process identity checks, signature rejection, key replacement, closure copy,

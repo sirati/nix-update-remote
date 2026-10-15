@@ -39,6 +39,10 @@ struct Options {
     health_timeout: Duration,
     /// Units started, without waiting, after each committed closure switch.
     commit_units: Vec<String>,
+    /// Names the committed system whose post-commit units may not have
+    /// started yet. It lives where the system profile does, so it survives
+    /// a reboot whenever the commit does.
+    commit_units_pending: PathBuf,
 }
 
 impl Options {
@@ -113,6 +117,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         if let Err(error) = host.republish_phase() {
             eprintln!("nix-update-remote: {error}");
         }
+        resume_commit_units(&options, Path::new("/run/current-system"));
     }
     // The rollback may have left a system with another updater.
     follow.check(&options);
@@ -308,6 +313,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut health_settle = Duration::from_secs(10);
     let mut health_timeout = Duration::from_secs(600);
     let mut commit_units = Vec::new();
+    let mut commit_units_pending = PathBuf::from(COMMIT_UNITS_PENDING);
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -339,6 +345,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
                         .map_err(|_| "invalid health timeout")?,
                 )
             }
+            "--commit-units-pending" => commit_units_pending = next_path(&mut iter, arg)?,
             "--commit-unit" => {
                 let unit = next_value(&mut iter, arg)?;
                 if !valid_unit_name(&unit) {
@@ -401,6 +408,9 @@ fn parse(args: &[String]) -> Result<Options, String> {
     if !state_dir.is_absolute() {
         return Err("state directory must be absolute".into());
     }
+    if !commit_units_pending.is_absolute() || commit_units_pending.starts_with("/nix/store") {
+        return Err("the pending post-commit units file must be an absolute mutable path".into());
+    }
     for command in artifact_prepare
         .iter()
         .chain(artifact_activate.iter())
@@ -454,6 +464,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         health_settle,
         health_timeout,
         commit_units,
+        commit_units_pending,
     })
 }
 
@@ -569,9 +580,14 @@ fn valid_unit_name(unit: &str) -> bool {
         && unit.bytes().all(|byte| byte.is_ascii_alphanumeric() || b":-_.@\\".contains(&byte))
 }
 
+/// Where the pending post-commit units are recorded by default: next to the
+/// system profile, on whatever keeps `/nix/var` across reboots.
+const COMMIT_UNITS_PENDING: &str = "/nix/var/nix-update-remote/commit-units-pending";
+
 /// Starts the post-commit units, such as verifications of what the commit
 /// installed. They run on their own; their failure is theirs to report and
-/// never changes the update's outcome.
+/// never changes the update's outcome. Once they are started, nothing is
+/// pending any more.
 fn start_commit_units(options: &Options) {
     let (Some(systemctl), false) = (&options.systemctl, options.commit_units.is_empty()) else {
         return;
@@ -581,8 +597,99 @@ fn start_commit_units(options: &Options) {
             .args(["start", "--no-block", "--"])
             .args(&options.commit_units),
         "starting the post-commit units",
-    );
+    )
+    .and_then(|()| clear_pending(&options.commit_units_pending));
     if let Err(error) = result {
+        eprintln!("nix-update-remote: {error}");
+    }
+}
+
+/// Records, before the switch, that `system`'s post-commit units are due
+/// once it commits: a reboot or a daemon stop between the commit and their
+/// start must not skip them.
+fn mark_pending(file: &Path, system: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let error = |e: std::io::Error| format!("recording the pending post-commit units in {}: {e}", file.display());
+    let directory = file.parent().ok_or("the pending post-commit units file has no directory")?;
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(directory).map_err(error)?;
+    let temporary = file.with_extension("new");
+    let mut out = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(error)?;
+    out.write_all(format!("{}\n", system.display()).as_bytes()).map_err(error)?;
+    out.sync_all().map_err(error)?;
+    fs::rename(&temporary, file).map_err(error)?;
+    fs::File::open(directory).and_then(|d| d.sync_all()).map_err(error)
+}
+
+fn read_pending(file: &Path) -> Result<Option<PathBuf>, String> {
+    match fs::read_to_string(file) {
+        Ok(text) => Ok(Some(PathBuf::from(text.trim_end_matches('\n')))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{}: {error}", file.display())),
+    }
+}
+
+fn clear_pending(file: &Path) -> Result<(), String> {
+    match fs::remove_file(file) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(format!("clearing {}: {error}", file.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Switches to `resolved` with the post-commit units marked pending until
+/// the commit's units start; a switch that did not commit leaves nothing
+/// pending.
+fn switch_marked(
+    options: &Options,
+    host: &mut dyn transaction::Host,
+    resolved: &Path,
+    events: &mut dyn Events,
+) -> Result<Outcome, String> {
+    if !options.commit_units.is_empty() {
+        mark_pending(&options.commit_units_pending, resolved)?;
+    }
+    let outcome = transaction::update(host, resolved, events);
+    if !matches!(outcome, Ok(Outcome::Committed { .. })) && !options.commit_units.is_empty() {
+        if let Err(error) = clear_pending(&options.commit_units_pending) {
+            eprintln!("nix-update-remote: {error}");
+        }
+    }
+    outcome
+}
+
+/// At daemon start, typically after a reboot: starts the post-commit units
+/// of a commit whose units never started, if the host runs that system and
+/// its profile names it. A pending mark of any other system is dropped: its
+/// switch did not commit, or another system replaced it.
+fn resume_commit_units(options: &Options, current: &Path) {
+    let pending = match read_pending(&options.commit_units_pending) {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("nix-update-remote: cannot read the pending post-commit units: {error}");
+            return;
+        }
+    };
+    let canonical = |path: &Path| fs::canonicalize(path).ok();
+    let system = canonical(&pending);
+    if !options.commit_units.is_empty()
+        && system.is_some()
+        && system == canonical(current)
+        && system == canonical(&options.profile)
+    {
+        eprintln!(
+            "nix-update-remote: starting the post-commit units of {}, which committed before they started",
+            pending.display()
+        );
+        start_commit_units(options);
+    } else if let Err(error) = clear_pending(&options.commit_units_pending) {
         eprintln!("nix-update-remote: {error}");
     }
 }
@@ -651,7 +758,7 @@ fn apply_switch(stream: &mut UnixStream, options: &Options) -> Reply {
         Err(error) => return Reply::Rejected(error),
     };
     record_event(options, &resolved, "before", "pending");
-    let outcome = transaction::update(&mut host, &resolved, &mut StreamEvents(stream));
+    let outcome = switch_marked(options, &mut host, &resolved, &mut StreamEvents(stream));
     let (result, reply) = match outcome {
         Err(error) => ("failure", Reply::Rejected(error)),
         Ok(outcome) => {
@@ -842,5 +949,99 @@ mod tests {
             }
             assert_eq!(host.journal, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+    use crate::transaction::fake::{FakeHost, path, system};
+    use std::os::unix::fs::symlink;
+
+    /// Options whose systemctl records its arguments and exits with `code`.
+    fn options(directory: &Path, code: i32) -> Options {
+        let systemctl = directory.join(format!("systemctl-{code}"));
+        fs::write(&systemctl, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nexit {code}\n", directory.join("started").display())).unwrap();
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+        let uid = rustix::process::getuid().as_raw().to_string();
+        let pending = directory.join("var/commit-units-pending");
+        let args: Vec<String> = [
+            "--nix", "/nix/store/x-nix/bin/nix", "--nix-env", "/nix/store/x-nix/bin/nix-env",
+            "--update-uid", &uid, "--systemctl", "/nix/store/x-systemd/bin/systemctl",
+            "--trusted-key", "update:AAAA", "--commit-unit", "rescue-verify.service",
+            "--commit-units-pending", pending.to_str().unwrap(),
+        ]
+        .map(String::from)
+        .to_vec();
+        Options { systemctl: Some(systemctl), profile: directory.join("system"), ..parse(&args).unwrap() }
+    }
+
+    fn started(directory: &Path) -> String {
+        fs::read_to_string(directory.join("started")).unwrap_or_default()
+    }
+
+    #[test]
+    fn post_commit_units_start_on_the_next_boot_after_a_reboot_skipped_them() {
+        let (Some(a), Some(b)) = (std::env::var_os("NIX_UPDATE_TEST_NIX"), std::env::var_os("NIX_UPDATE_TEST_COREUTILS")) else {
+            panic!("NIX_UPDATE_TEST_NIX and NIX_UPDATE_TEST_COREUTILS must name store paths");
+        };
+        let directory = std::env::temp_dir().join(format!("nur-pending-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let options = options(&directory, 0);
+        let pending = options.commit_units_pending.clone();
+
+        // A switch that commits leaves its units pending until they start:
+        // a reboot right after the commit keeps the mark.
+        let mut host = FakeHost::running(("old", system(&["sshd.service"])), ("new", system(&["sshd.service"])));
+        let outcome = switch_marked(&options, &mut host, &path("new"), &mut LogEvents).unwrap();
+        assert!(matches!(outcome, Outcome::Committed { .. }), "{outcome:?}");
+        assert_eq!(read_pending(&pending).unwrap(), Some(path("new")));
+        // A switch that rolls back leaves nothing pending.
+        let mut broken = system(&["sshd.service", "app.service"]);
+        broken.failing.insert("app.service".into());
+        let mut host = FakeHost::running(("old", system(&["sshd.service"])), ("new", broken));
+        let outcome = switch_marked(&options, &mut host, &path("new"), &mut LogEvents).unwrap();
+        assert!(matches!(outcome, Outcome::RolledBack { .. }), "{outcome:?}");
+        assert_eq!(read_pending(&pending).unwrap(), None);
+
+        // The next boot runs the committed system A: its units start once.
+        let current = directory.join("current-system");
+        symlink(&a, &current).unwrap();
+        symlink(&a, directory.join("system-2-link")).unwrap();
+        symlink("system-2-link", directory.join("system")).unwrap();
+        mark_pending(&pending, Path::new(&a)).unwrap();
+        resume_commit_units(&options, &current);
+        assert_eq!(started(&directory), "start\n--no-block\n--\nrescue-verify.service\n");
+        assert_eq!(read_pending(&pending).unwrap(), None);
+        resume_commit_units(&options, &current);
+        assert_eq!(started(&directory).lines().count(), 4, "started twice");
+
+        // The boot came up on another system: the switch did not commit.
+        fs::remove_file(directory.join("started")).unwrap();
+        mark_pending(&pending, Path::new(&b)).unwrap();
+        resume_commit_units(&options, &current);
+        assert_eq!(started(&directory), "");
+        assert_eq!(read_pending(&pending).unwrap(), None);
+
+        // Units that could not be started stay pending for the next start.
+        let failing = Options { systemctl: self::options(&directory, 1).systemctl, ..options };
+        mark_pending(&pending, Path::new(&a)).unwrap();
+        resume_commit_units(&failing, &current);
+        assert!(started(&directory).contains("rescue-verify.service"));
+        assert_eq!(read_pending(&pending).unwrap(), Some(PathBuf::from(&a)));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn the_pending_file_is_mutable_and_absolute() {
+        let uid = rustix::process::getuid().as_raw().to_string();
+        let base = ["--nix", "/nix/store/x/bin/nix", "--nix-env", "/nix/store/x/bin/nix-env", "--update-uid", &uid,
+            "--systemctl", "/nix/store/s/bin/systemctl", "--trusted-key", "update:AAAA"];
+        let with = |file: &str| parse(&[&base[..], &["--commit-units-pending", file]].concat().iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert!(with("relative").is_err());
+        assert!(with("/nix/store/x-pending").is_err());
+        assert_eq!(with("/persistent/pending").unwrap().commit_units_pending, Path::new("/persistent/pending"));
+        assert_eq!(parse(&base.map(String::from)).unwrap().commit_units_pending, Path::new(COMMIT_UNITS_PENDING));
     }
 }
