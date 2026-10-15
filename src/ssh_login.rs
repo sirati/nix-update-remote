@@ -17,6 +17,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
             println!("{}", path.display());
             Ok(())
         }
+        [command] if command == "committed-system" => {
+            let path = committed_system(Path::new("/run/current-system"), Path::new(PROFILE))?;
+            println!("{}", path.display());
+            Ok(())
+        }
+        [command] if command == "ping" => {
+            println!("{}", ping(Path::new(protocol::SOCKET), RETRY_LIMIT)?);
+            Ok(())
+        }
         [command]
             if env::var("NIX_UPDATE_REMOTE_MODE").as_deref() != Ok("artifact")
                 && (command == "nix-daemon --stdio"
@@ -37,6 +46,47 @@ pub fn run(args: &[String]) -> Result<(), String> {
             proxy_artifact()
         }
         _ => Err("SSH account accepts only the updater protocol".into()),
+    }
+}
+
+const PROFILE: &str = "/nix/var/nix/profiles/system";
+
+/// The running system, if it is also the one the system profile names: an
+/// update to it committed, and none is half done.
+fn committed_system(current: &Path, profile: &Path) -> Result<std::path::PathBuf, String> {
+    let running = std::fs::canonicalize(current).map_err(|error| format!("{}: {error}", current.display()))?;
+    let committed = std::fs::canonicalize(profile).map_err(|error| format!("{}: {error}", profile.display()))?;
+    if !running.starts_with("/nix/store/") {
+        return Err("current system is not canonical in the Nix store".into());
+    }
+    if running != committed {
+        return Err("the running system is not the committed system profile".into());
+    }
+    Ok(running)
+}
+
+/// Asks the broker for its version, through the same socket and peer check
+/// as an update. A broker that restarts into the current updater, or whose
+/// socket is briefly gone between two brokers, is asked again until `limit`
+/// passes; a busy broker is waited for.
+fn ping(socket: &Path, limit: std::time::Duration) -> Result<String, String> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        // Only reaching the broker is retried; its answer is final.
+        let error = match send_apply_request(socket, protocol::ping_request().as_bytes(), limit) {
+            Ok((first, mut rest)) => {
+                let mut trailing = [0];
+                return match rest.read(&mut trailing) {
+                    Ok(0) => protocol::parse_pong(&first),
+                    _ => Err("trailing broker response".into()),
+                };
+            }
+            Err(error) => error,
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("cannot reach the update broker: {error}"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }
 
@@ -349,6 +399,73 @@ mod restart_tests {
         assert!(error.contains("runs /a") && error.contains("system is /b"), "{error}");
         // Without a broker the login fails at once, as before.
         assert!(send_apply_request(&dir.join("missing"), b"REQUEST\n", Duration::from_secs(60)).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
+    fn directory(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nur-probe-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    fn broker(path: &Path, answer: &'static [u8]) -> std::thread::JoinHandle<Vec<u8>> {
+        let listener = UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            stream.write_all(answer).unwrap();
+            request
+        })
+    }
+
+    #[test]
+    fn a_ping_reports_the_broker_and_its_refusal() {
+        let dir = directory("ping");
+        let path = dir.join("control.sock");
+        let served = broker(&path, b"PONG 0.1.0 /nix/store/abc-nix-update-remote/bin/nix-update-remote\n");
+        let answer = ping(&path, Duration::from_secs(5)).unwrap();
+        assert!(answer.contains("/nix/store/abc-nix-update-remote"), "{answer}");
+        assert_eq!(served.join().unwrap(), protocol::ping_request().as_bytes());
+        std::fs::remove_file(&path).unwrap();
+        let served = broker(&path, b"REJECTED control peer has the wrong UID\n");
+        assert!(ping(&path, Duration::from_secs(5)).unwrap_err().contains("wrong UID"));
+        served.join().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // No broker at all: the probe fails once its retry window passes.
+        let error = ping(&path, Duration::from_millis(600)).unwrap_err();
+        assert!(error.contains("cannot reach the update broker"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn only_a_running_system_that_the_profile_names_is_committed() {
+        // Two real store paths stand for two systems.
+        let (Some(a), Some(b)) = (
+            std::env::var_os("NIX_UPDATE_TEST_NIX"),
+            std::env::var_os("NIX_UPDATE_TEST_COREUTILS"),
+        ) else {
+            panic!("NIX_UPDATE_TEST_NIX and NIX_UPDATE_TEST_COREUTILS must name store paths");
+        };
+        let dir = directory("committed");
+        let (current, profile, link) = (dir.join("current"), dir.join("system"), dir.join("system-7-link"));
+        symlink(&a, &current).unwrap();
+        symlink(&a, &link).unwrap();
+        symlink("system-7-link", &profile).unwrap();
+        assert_eq!(committed_system(&current, &profile).unwrap(), std::fs::canonicalize(&a).unwrap());
+        // Activated with `test` but not committed: the profile names another.
+        std::fs::remove_file(&link).unwrap();
+        symlink(&b, &link).unwrap();
+        assert!(committed_system(&current, &profile).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

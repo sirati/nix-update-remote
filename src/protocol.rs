@@ -288,3 +288,56 @@ mod switch_line_tests {
         assert_eq!(one_line(&"é".repeat(MAX_REASON)).len(), MAX_REASON);
     }
 }
+
+/// The probe request: proves that a login helper of the update account
+/// reaches the broker, passes its peer check and that both run the same
+/// updater. It changes nothing on the host.
+pub fn ping_request() -> String {
+    format!("{MAGIC}\nPING\n")
+}
+
+/// The broker's answer to [`ping_request`]: its version and binary.
+pub fn pong(binary: &Path) -> String {
+    format!("PONG {} {}\n", env!("CARGO_PKG_VERSION"), binary.display())
+}
+
+/// The first answer line to a ping: `Ok` with the broker's version and
+/// binary, or the refusal.
+pub fn parse_pong(line: &str) -> Result<String, String> {
+    if let Some(rest) = line.strip_prefix("PONG ") {
+        let mut fields = rest.split(' ');
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some(version), Some(binary), None) if !version.is_empty() && binary.starts_with("/nix/store/") => {
+                return Ok(format!("update broker {version} at {binary}"));
+            }
+            _ => return Err("invalid ping answer".into()),
+        }
+    }
+    match SwitchLine::parse(line) {
+        Ok(line) if line.failure().is_some() => Err(line.failure().unwrap_or_default()),
+        _ if line.starts_with(RETRY) => Err(format!("the update broker is restarting: {line}")),
+        _ => Err("invalid ping answer".into()),
+    }
+}
+
+#[cfg(test)]
+mod ping_tests {
+    use super::*;
+
+    #[test]
+    fn a_ping_names_the_broker_and_a_refusal_keeps_its_reason() {
+        let line = pong(Path::new("/nix/store/abc-nix-update-remote/bin/nix-update-remote"));
+        assert!(line.ends_with('\n'));
+        let answer = parse_pong(line.trim_end()).unwrap();
+        assert!(answer.contains(env!("CARGO_PKG_VERSION")), "{answer}");
+        assert!(answer.contains("/nix/store/abc-nix-update-remote"), "{answer}");
+        let refused = parse_pong("REJECTED control peer has the wrong UID").unwrap_err();
+        assert!(refused.contains("wrong UID"), "{refused}");
+        // A broker that predates the probe answers the unknown operation so.
+        assert!(parse_pong("ERR update rejected").unwrap_err().contains("unchanged"));
+        for line in ["PONG", "PONG 1", "PONG 1 /tmp/x", "PONG 1 /nix/store/a extra", "OK /nix/store/a"] {
+            assert!(parse_pong(line).is_err(), "{line}");
+        }
+        assert_eq!(ping_request(), format!("{MAGIC}\nPING\n"));
+    }
+}

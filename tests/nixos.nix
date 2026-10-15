@@ -57,6 +57,11 @@ in
         beforeHooks = [ "${testHook}/bin/update-hook-fixture" ];
         afterHooks = [ "${testHook}/bin/update-hook-fixture" ];
       };
+      services.nixUpdateRemote.commitUnits = [ "commit-check.service" ];
+      systemd.services.commit-check.serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${pkgs.coreutils}/bin/touch /run/commit-check-ran";
+      };
       services.openssh = {
         enable = true;
         settings.PermitRootLogin = "no";
@@ -180,6 +185,18 @@ in
       f"grep -Fx 'OK {first}'"
     )
     machine.succeed("grep -Fx first /etc/remote-update-generation")
+    # The commit starts the post-commit checks.
+    machine.wait_until_succeeds("test -e /run/commit-check-ran")
+    # The host names the committed system to a resuming client.
+    assert client.succeed(f"{ssh_a} committed-system").strip() == first
+    # The probe takes the update login program through the broker's peer
+    # check, and fails when the broker is gone.
+    machine.succeed("systemctl start nix-update-remote-probe.service")
+    machine.succeed("journalctl -u nix-update-remote-probe.service --no-pager | grep -F 'update broker'")
+    machine.succeed("systemctl stop nix-update-remote.service")
+    machine.fail("systemctl start nix-update-remote-probe.service")
+    machine.succeed("systemctl start nix-update-remote.service")
+    machine.wait_until_succeeds("systemctl start nix-update-remote-probe.service")
     machine.succeed("systemctl start system-update-report-delivery.service")
     machine.wait_until_succeeds("test $(systemctl show system-update-report-delivery.service -p ActiveState --value) = inactive")
     events = machine.succeed("cat /tmp/update-hook-events").splitlines()

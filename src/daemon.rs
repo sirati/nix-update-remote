@@ -34,6 +34,8 @@ struct Options {
     health_units: Vec<String>,
     health_settle: Duration,
     health_timeout: Duration,
+    /// Units started, without waiting, after each committed closure switch.
+    commit_units: Vec<String>,
 }
 
 impl Options {
@@ -297,6 +299,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut health_units = Vec::new();
     let mut health_settle = Duration::from_secs(10);
     let mut health_timeout = Duration::from_secs(600);
+    let mut commit_units = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -327,6 +330,13 @@ fn parse(args: &[String]) -> Result<Options, String> {
                         .parse()
                         .map_err(|_| "invalid health timeout")?,
                 )
+            }
+            "--commit-unit" => {
+                let unit = next_value(&mut iter, arg)?;
+                if !valid_unit_name(&unit) {
+                    return Err("invalid commit unit".into());
+                }
+                commit_units.push(unit);
             }
             "--artifact-prepare-arg" => artifact_prepare_args.push(next_value(&mut iter, arg)?),
             "--artifact-activate-arg" => artifact_activate_args.push(next_value(&mut iter, arg)?),
@@ -373,6 +383,9 @@ fn parse(args: &[String]) -> Result<Options, String> {
     }
     if artifact_prepare.is_some() != artifact_activate.is_some() {
         return Err("artifact backend requires prepare and activate executables".into());
+    }
+    if !commit_units.is_empty() && artifact_prepare.is_some() {
+        return Err("post-commit units apply only to closure updates".into());
     }
     if artifact_prepare.is_none() && systemctl.is_none() {
         return Err("closure updates require --systemctl for their health checks".into());
@@ -431,6 +444,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         health_units,
         health_settle,
         health_timeout,
+        commit_units,
     })
 }
 
@@ -457,6 +471,8 @@ enum Reply {
     Rejected(String),
     RolledBack(String),
     RollbackFailed(String),
+    /// The answer to a probe; nothing changed.
+    Pong,
 }
 
 fn report_outcome(outcome: &Outcome) -> &'static str {
@@ -499,9 +515,15 @@ fn handle(mut stream: UnixStream, options: &Options, follow: &mut Follow) {
         }
         Reply::RolledBack(text) => format!("ROLLED-BACK {}\n", protocol::one_line(text)),
         Reply::RollbackFailed(text) => format!("ROLLBACK-FAILED {}\n", protocol::one_line(text)),
+        Reply::Pong => protocol::pong(
+            &fs::read_link("/proc/self/exe").unwrap_or_else(|_| PathBuf::from("/proc/self/exe")),
+        ),
     };
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.shutdown(std::net::Shutdown::Write);
+    if switch && matches!(reply, Reply::Switched(_, false)) {
+        start_commit_units(options);
+    }
     if matches!(reply, Reply::Switched(_, true)) {
         if let Some(command) = &options.reboot_command {
             if let Err(error) = verify::checked(
@@ -526,6 +548,33 @@ fn handle(mut stream: UnixStream, options: &Options, follow: &mut Follow) {
                 Err(error) => eprintln!("nix-update-remote: {error}"),
             }
         }
+    }
+}
+
+/// A systemd unit name the daemon may start: no option, no glob, no path.
+fn valid_unit_name(unit: &str) -> bool {
+    !unit.is_empty()
+        && unit.len() <= 255
+        && !unit.starts_with('-')
+        && unit.contains('.')
+        && unit.bytes().all(|byte| byte.is_ascii_alphanumeric() || b":-_.@\\".contains(&byte))
+}
+
+/// Starts the post-commit units, such as verifications of what the commit
+/// installed. They run on their own; their failure is theirs to report and
+/// never changes the update's outcome.
+fn start_commit_units(options: &Options) {
+    let (Some(systemctl), false) = (&options.systemctl, options.commit_units.is_empty()) else {
+        return;
+    };
+    let result = verify::checked(
+        Command::new(systemctl)
+            .args(["start", "--no-block", "--"])
+            .args(&options.commit_units),
+        "starting the post-commit units",
+    );
+    if let Err(error) = result {
+        eprintln!("nix-update-remote: {error}");
     }
 }
 
@@ -555,6 +604,8 @@ fn apply_request(stream: &mut UnixStream, options: &Options) -> (Reply, bool) {
             false,
         ),
         Ok("SWITCH") if options.artifact_prepare.is_none() => (apply_switch(stream, options), true),
+        // The peer check above already passed: that is what a probe proves.
+        Ok("PING") => (Reply::Pong, false),
         Ok(_) => (Reply::Rejected("operation is disabled for this backend".into()), false),
     }
 }
@@ -717,6 +768,49 @@ mod tests {
         assert_eq!(login_shell(passwd, 2990).unwrap(), Path::new("/nix/store/aaa-nix-update-remote/bin/nix-update-remote"));
         assert!(login_shell(passwd, 2991).is_err());
         assert!(login_shell("update:x:2990:2990::/var/empty:relative\n", 2990).is_err());
+    }
+
+    fn options(extra: &[&str]) -> Result<Options, String> {
+        let uid = rustix::process::getuid().as_raw().to_string();
+        let mut args: Vec<String> = [
+            "--nix", "/nix/store/x-nix/bin/nix", "--nix-env", "/nix/store/x-nix/bin/nix-env",
+            "--update-uid", &uid, "--systemctl", "/nix/store/x-systemd/bin/systemctl",
+            "--trusted-key", "update:AAAA",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        args.extend(extra.iter().map(|s| s.to_string()));
+        parse(&args)
+    }
+
+    #[test]
+    fn a_ping_from_this_updater_binary_gets_a_pong_and_changes_nothing() {
+        let options = options(&[]).unwrap();
+        let (mut daemon_side, mut client) = UnixStream::pair().unwrap();
+        client.write_all(protocol::ping_request().as_bytes()).unwrap();
+        let (reply, switch) = apply_request(&mut daemon_side, &options);
+        assert!(matches!(reply, Reply::Pong), "the probe was not answered");
+        assert!(!switch);
+        // A peer under another UID fails the same peer check as an update.
+        let other = Options { update_uid: options.update_uid + 1, ..options };
+        let (mut daemon_side, mut client) = UnixStream::pair().unwrap();
+        client.write_all(protocol::ping_request().as_bytes()).unwrap();
+        assert!(matches!(apply_request(&mut daemon_side, &other).0, Reply::Rejected(_)));
+    }
+
+    #[test]
+    fn commit_units_are_plain_unit_names_for_closure_updates_only() {
+        let parsed = options(&["--commit-unit", "nmbl-rescue-verify.service"]).unwrap();
+        assert_eq!(parsed.commit_units, ["nmbl-rescue-verify.service"]);
+        for bad in ["-x.service", "a b.service", "*.service", "../x.service", "noext", ""] {
+            assert!(options(&["--commit-unit", bad]).is_err(), "{bad:?}");
+        }
+        assert!(options(&[
+            "--commit-unit", "a.service",
+            "--artifact-prepare", "/nix/store/p", "--artifact-activate", "/nix/store/a",
+        ])
+        .is_err());
     }
 
     #[test]

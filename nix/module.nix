@@ -90,6 +90,36 @@ in
         description = "Ports on which sshd must listen after a switch and after a rollback.";
       };
     };
+    commitUnits = lib.mkOption {
+      type = lib.types.listOf (lib.types.strMatching "[A-Za-z0-9:_.@\\\\-]+\\.[a-z]+");
+      default = [ ];
+      example = [ "nmbl-rescue-verify.service" ];
+      description = ''
+        Units the broker starts, without waiting for them, after each
+        committed closure update: checks of what the commit installed. Their
+        result never changes the update's outcome; a failing one reports
+        through its own unit state.
+      '';
+    };
+    probe = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Probe the update path continuously: a timer runs the update
+          account's login program as that account, which asks the broker
+          for its version through the control socket and the same peer
+          check as an update. `nix-update-remote-probe.service` fails when
+          the broker is down, refuses the login program or runs another
+          updater than the current system's.
+        '';
+      };
+      interval = lib.mkOption {
+        type = lib.types.str;
+        default = "5min";
+        description = "Time between two probes (systemd time span).";
+      };
+    };
     reportQueue = lib.mkOption {
       type = lib.types.str;
       default = "/persistent/system-update-reports";
@@ -244,6 +274,7 @@ in
             ++ lib.concatMap (arg: [ "--artifact-activate-arg" arg ]) ([ "activate-erofs" ] ++ artifactArgs)
           )
           ++ lib.concatMap (unit: [ "--health-unit" unit ]) cfg.health.units
+          ++ lib.concatMap (unit: [ "--commit-unit" unit ]) cfg.commitUnits
           ++ lib.concatMap (port: [ "--ssh-port" (toString port) ]) cfg.health.sshPorts
           ++ lib.concatMap (key: [ "--trusted-key" key ]) cfg.trustedPublicKeys
           ++ lib.optionals (cfg.trustedPublicKeysFile != null) [
@@ -259,6 +290,33 @@ in
           ++ lib.concatMap (hook: [ "--after-hook" hook ]) cfg.afterHooks
         );
       };
+    };
+
+    # The login program of the update account, run as that account: what
+    # sshd runs for an update, minus the network.
+    systemd.services.nix-update-remote-probe = lib.mkIf cfg.probe.enable {
+      description = "Probe the update path through the update account's login program";
+      after = [ "nix-update-remote.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        User = cfg.user;
+        Group = cfg.user;
+        ExecStart = lib.escapeShellArgs [ config.users.users.${cfg.user}.shell "-c" "ping" ];
+        # The broker serves one connection at a time: a probe waits out an
+        # update in progress, up to its health timeout and a margin.
+        TimeoutStartSec = "${toString (cfg.health.timeoutSeconds + 900)}s";
+        CapabilityBoundingSet = "";
+        NoNewPrivileges = true;
+        PrivateNetwork = true;
+        PrivateTmp = true;
+        ProtectHome = true;
+        ProtectSystem = "strict";
+        RestrictAddressFamilies = [ "AF_UNIX" ];
+      };
+    };
+    systemd.timers.nix-update-remote-probe = lib.mkIf cfg.probe.enable {
+      wantedBy = [ "timers.target" ];
+      timerConfig = { OnBootSec = cfg.probe.interval; OnUnitInactiveSec = cfg.probe.interval; };
     };
 
     systemd.services.system-update-report-delivery = lib.mkIf (cfg.beforeHooks != [ ] || cfg.afterHooks != [ ]) {

@@ -103,8 +103,23 @@ fn deploy_with(options: &Options) -> Result<(), String> {
         options.progress_command.clone(),
         options.progress_args.clone(),
     );
-    copy_closure(&system, &store, &transport, &progress)?;
-    apply(&options, &system, &transport, &progress)?;
+    if committed_system(&transport).as_deref() == Some(system.as_path()) {
+        // An earlier run committed this system, and its secret deployment
+        // may have failed: resume with that step alone.
+        progress.report(
+            "resume",
+            format!(
+                "{} already runs {}; skipping the switch and deploying only the secrets",
+                options.target,
+                system.display()
+            ),
+            None,
+        );
+        secrets_only(&mut || activation_callback(options), &system)?;
+    } else {
+        copy_closure(&system, &store, &transport, &progress)?;
+        apply(&options, &system, &transport, &progress)?;
+    }
     if let Some(command) = &options.post_command {
         run(
             Command::new(command).args(&options.post_args),
@@ -590,7 +605,10 @@ fn follow(
                 if !warnings.is_empty() {
                     warn(&format!("updated with warnings: {}", warnings.join("; ")));
                 }
-                return callback.unwrap_or_else(callback_failed);
+                // The host committed: only the secrets are missing.
+                return callback
+                    .unwrap_or_else(callback_failed)
+                    .map_err(|_| secrets_not_deployed(system));
             }
             verdict if verdict.is_final() && verdict.failure().is_some() => {
                 return Err(verdict.failure().unwrap());
@@ -700,6 +718,47 @@ impl Drop for Transport {
             let _ = child.wait();
         }
         let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// The system the host runs and has committed, from its login helper; `None`
+/// when it is not committed, or the helper predates the question.
+fn committed_system(transport: &Transport) -> Option<PathBuf> {
+    let output = Command::new("ssh")
+        .args(transport.channel_args())
+        .args(["--", &transport.target, "committed-system"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .managed_output()
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    let path = text.strip_suffix('\n')?;
+    (output.status.success() && path.starts_with("/nix/store/") && !path.contains('\n'))
+        .then(|| PathBuf::from(path))
+}
+
+/// What the operator must read when the host committed `system` but the
+/// secret deployment did not finish.
+fn secrets_not_deployed(system: &Path) -> String {
+    format!(
+        "update committed, secrets NOT deployed: the host now runs {}, but its secret deployment failed. \
+         Run the same update again: it skips the switch and deploys only the secrets",
+        system.display()
+    )
+}
+
+/// Runs the secret deployment for a host that already runs `system`.
+fn secrets_only(
+    start: &mut dyn FnMut() -> Result<Option<Box<dyn Running>>, String>,
+    system: &Path,
+) -> Result<(), String> {
+    let Some(mut step) = start()? else { return Ok(()) };
+    loop {
+        match step.poll()? {
+            Some(true) => return Ok(()),
+            Some(false) => return Err(secrets_not_deployed(system)),
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
     }
 }
 
@@ -1043,12 +1102,28 @@ mod tests {
         assert_eq!(result, Ok(()));
         assert_eq!(probe.started.load(Ordering::SeqCst), 1);
         let (result, _, reports) = drive(&["ACTIVATED /nix/store/test-system", "OK /nix/store/test-system"], false, Some(false));
-        assert!(result.is_err());
+        let error = result.unwrap_err();
+        // The operator must see that the host changed and what is missing.
+        assert!(error.contains("update committed, secrets NOT deployed"), "{error}");
+        assert!(error.contains("/nix/store/test-system"), "{error}");
+        assert!(error.contains("deploys only the secrets"), "{error}");
         assert_eq!(reports.len(), 1, "a failed secret step is reported at once");
         // Legacy brokers send only their receipt; the callback runs once.
         let (result, probe, _) = drive(&["OK /nix/store/test-system"], false, Some(true));
         assert_eq!(result, Ok(()));
         assert_eq!(probe.started.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn resuming_a_committed_host_runs_only_the_secret_step() {
+        let system = Path::new("/nix/store/test-system");
+        let probe = Probe::default();
+        assert_eq!(secrets_only(&mut probe.starter(Some(true)), system), Ok(()));
+        assert_eq!(probe.started.load(Ordering::SeqCst), 1);
+        let error = secrets_only(&mut probe.starter(Some(false)), system).unwrap_err();
+        assert!(error.contains("update committed, secrets NOT deployed"), "{error}");
+        // Without a secret step there is nothing left to do.
+        assert_eq!(secrets_only(&mut || Ok(None), system), Ok(()));
     }
 
     #[test]

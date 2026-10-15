@@ -75,6 +75,25 @@ paths get no exemption. Nix trusts those by hash, and any account that reaches
 the store, the update account included, can add them. The host also checks
 that each path's contents match its recorded NAR hash.
 
+An update that committed but whose secret deployment failed ends with
+"update committed, secrets NOT deployed". Running the same update again finds,
+through the login program's `committed-system`, that the host already runs
+and has committed that system, skips the copy and the switch, and deploys only
+the secrets.
+
+`configured-deploy` checks the git tree of a local flake before anything is
+signed. When tracked files have uncommitted changes, it names them in a red
+warning and goes ahead only if the operator confirms, through the plan's
+`confirmCommand` or, without one, by typing `yes` on the terminal.
+
+`services.nixUpdateRemote.probe` (on by default) runs the update account's
+login program as that account every few minutes. It asks the broker for its
+version through the control socket and the same peer check as an update, so
+`nix-update-remote-probe.service` fails when the broker is down, refuses the
+login program, or runs another updater than the current system's.
+`services.nixUpdateRemote.commitUnits` lists units the broker starts after each
+committed closure update, such as checks of what the commit installed.
+
 The integration VM tests the restricted SSH account, validation on both sides,
 process identity checks, signature rejection, key replacement, closure copy,
 hook ordering and privilege, and activation.
