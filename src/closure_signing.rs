@@ -281,9 +281,53 @@ fn query_manifest(
     }
     Ok(request)
 }
-pub fn sign(system: &Path, roots: &Path, command: &Path, args: &[String]) -> Result<(), String> {
-    let paths = closure_paths("nix", &[], system)?;
-    let request = query_manifest("nix", &[], &paths, BATCH_SIZE)?;
+/// Signs the closure of `system` through the external signer. Paths that
+/// already carry a valid signature by one of `reuse_keys` keep it, and the
+/// signer is asked only for the others, or not at all.
+///
+/// A Nix signature covers the path's fingerprint (store path, NAR hash, NAR
+/// size, references), not one deployment: a signature made in an earlier run
+/// authorizes exactly what a new one would. It is reused only after it
+/// verifies against the given public key here, and the host verifies every
+/// path again before it activates anything.
+pub fn sign(
+    system: &Path,
+    roots: &Path,
+    command: &Path,
+    args: &[String],
+    reuse_keys: &[String],
+) -> Result<(), String> {
+    sign_in("nix", &[], system, roots, command, args, reuse_keys)
+}
+fn sign_in(
+    nix: &str,
+    prefix: &[String],
+    system: &Path,
+    roots: &Path,
+    command: &Path,
+    args: &[String],
+    reuse_keys: &[String],
+) -> Result<(), String> {
+    let paths = closure_paths(nix, prefix, system)?;
+    let mut request = query_manifest(nix, prefix, &paths, BATCH_SIZE)?;
+    if !reuse_keys.is_empty() {
+        let keys = parse_keys(reuse_keys)?;
+        let total = request.paths.len();
+        request.paths.retain(|info| !signed_by(info, &keys));
+        if request.paths.is_empty() {
+            eprintln!(
+                "nix-update-remote: all {total} closure paths already carry a valid signature by the update key; not signing again"
+            );
+            return Ok(());
+        }
+        if request.paths.len() < total {
+            eprintln!(
+                "nix-update-remote: reusing valid update-key signatures on {} of {total} closure paths",
+                total - request.paths.len()
+            );
+        }
+    }
+    let paths: Vec<String> = request.paths.iter().map(|info| info.path.clone()).collect();
     let input = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
     let response = external_signing::exchange_limit(
         command.to_str().ok_or("non-UTF8 signer path")?,
@@ -314,24 +358,18 @@ pub fn sign(system: &Path, roots: &Path, command: &Path, args: &[String]) -> Res
         )
         .map_err(|e| e.to_string())?;
     }
-    let status = Command::new("nix")
-        .args([
-            "--extra-experimental-features",
-            "nix-command",
-            "store",
-            "copy-sigs",
-            "--substituter",
-        ])
+    // Only the paths just signed; the others keep their signatures.
+    let status = query_command(nix, prefix)
+        .args(["store", "copy-sigs", "--substituter"])
         .arg(format!("file://{}", cache.display()))
-        .arg("--recursive")
-        .arg(system)
+        .args(&paths)
         .managed_status()
         .map_err(|e| e.to_string())?;
     if !status.success() {
         return Err("importing external closure signatures failed".into());
     }
     for batch in paths.chunks(BATCH_SIZE) {
-        let bytes = metadata_batch("nix", &[], batch)?;
+        let bytes = metadata_batch(nix, prefix, batch)?;
         let observed: BTreeMap<String, serde_json::Value> =
             serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         if observed.keys().ne(batch.iter()) {
@@ -785,5 +823,91 @@ mod tests {
             0,
             "signature cache must contain no NAR"
         );
+    }
+    /// A closure the update key already signed is not signed again: the
+    /// signer is not even started. Only paths without a valid signature by
+    /// that key reach it.
+    #[test]
+    fn valid_update_key_signatures_are_reused_instead_of_asking_the_signer() {
+        let nix = std::env::var("NIX_UPDATE_TEST_NIX").unwrap_or_else(|_| "nix".into());
+        let tool = |name: &str| {
+            std::env::var("NIX_UPDATE_TEST_COREUTILS")
+                .map(|bin| std::path::PathBuf::from(bin).join(name))
+                .unwrap_or_else(|_| name.into())
+        };
+        let temp = std::env::temp_dir().join(format!(
+            "signature-reuse-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&temp).unwrap();
+        struct Guard(std::path::PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = Command::new("chmod").arg("-R").arg("u+w").arg(&self.0).status();
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Guard(temp.clone());
+        let store = format!("local?root={}", temp.join("store").display());
+        let prefix: Vec<String> = ["--option", "build-users-group", "", "--store", &store]
+            .map(str::to_owned)
+            .to_vec();
+        let run = |arguments: &[&str], input: Option<&[u8]>| {
+            use std::io::Write;
+            let mut child = query_command(&nix, &prefix)
+                .args(arguments)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(input.unwrap_or_default()).unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "Nix {arguments:?}: {}", String::from_utf8_lossy(&output.stderr));
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let fixture = temp.join("fixture");
+        fs::write(&fixture, b"public signature reuse fixture").unwrap();
+        let leaf = run(&["store", "add-path", "--name", "reuse-leaf", fixture.to_str().unwrap()], None);
+        let expression = format!("builtins.toFile \"reuse-root\" (builtins.storePath \"{leaf}\")");
+        let root = run(&["eval", "--impure", "--raw", "--expr", &expression], None);
+        let secret = run(&["key", "generate-secret", "--key-name", "host-system-update"], None);
+        let public = run(&["key", "convert-secret-to-public"], Some(secret.as_bytes()));
+        let other_secret = run(&["key", "generate-secret", "--key-name", "host-system-update"], None);
+        let key_file = temp.join("update-key");
+        let other_file = temp.join("other-key");
+        fs::write(&key_file, &secret).unwrap();
+        fs::write(&other_file, &other_secret).unwrap();
+        let roots = temp.join("roots");
+        fs::create_dir(&roots).unwrap();
+        let signer_input = temp.join("signer-input");
+        let sign = |signer: &str, args: &[String], reuse: &[String]| {
+            let _ = fs::remove_dir_all(roots.join("signature-cache"));
+            sign_in(&nix, &prefix, Path::new(&root), &roots, &tool(signer), args, reuse)
+        };
+        let capture = [signer_input.to_str().unwrap().to_owned()];
+        let reuse = [public.clone()];
+        // A signature by another key under the same name is no reason to
+        // skip the signer.
+        run(&["store", "sign", "--key-file", other_file.to_str().unwrap(), &leaf], None);
+        assert!(sign("tee", &capture, &reuse).is_err());
+        let asked = fs::read_to_string(&signer_input).unwrap();
+        assert!(asked.contains(&format!("\"path\":\"{root}\"")) && asked.contains(&format!("\"path\":\"{leaf}\"")), "{asked}");
+        // The signer is asked only for the path the update key did not sign.
+        run(&["store", "sign", "--key-file", key_file.to_str().unwrap(), &leaf], None);
+        assert!(sign("tee", &capture, &reuse).is_err());
+        let asked = fs::read_to_string(&signer_input).unwrap();
+        assert!(asked.contains(&format!("\"path\":\"{root}\"")) && !asked.contains(&format!("\"path\":\"{leaf}\"")), "{asked}");
+        // Once every path carries the update key's signature, a signer that
+        // would refuse is never started.
+        run(&["store", "sign", "--key-file", key_file.to_str().unwrap(), &root], None);
+        sign("false", &[], &reuse).unwrap();
+        // Without the key to check them against, nothing is reused.
+        assert!(sign("false", &[], &[]).unwrap_err().contains("external signing command failed"));
+        require_signed_in(&nix, &prefix, Path::new(&root), &reuse).unwrap();
     }
 }

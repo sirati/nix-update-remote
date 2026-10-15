@@ -303,3 +303,19 @@ fn a_switch_that_never_activated_the_new_system_rolls_back() {
     );
     assert_restored(&host);
 }
+
+#[test]
+fn each_stage_is_announced_as_it_starts() {
+    use Stage::*;
+    let (outcome, events) = run(&mut host_with(new_system()));
+    assert!(matches!(outcome, Outcome::Committed { .. }), "{outcome:?}");
+    assert_eq!(events.1, [Activating, HealthGate, Committing]);
+    let mut failing = new_system();
+    failing.health_fails = true;
+    let (_, events) = run(&mut host_with(failing));
+    assert_eq!(events.1, [Activating, HealthGate, RollingBack]);
+    let mut unbootable = new_system();
+    unbootable.boot_exit = 1;
+    let (_, events) = run(&mut host_with(unbootable));
+    assert_eq!(events.1, [Activating, HealthGate, Committing, RollingBack]);
+}

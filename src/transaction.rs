@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+pub use crate::protocol::Stage;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -67,6 +68,8 @@ pub trait Events {
     fn waiting(&mut self, phase: &str);
     /// Something the operator must see that does not fail the update.
     fn warning(&mut self, text: &str);
+    /// The transaction enters `stage`.
+    fn stage(&mut self, _stage: Stage) {}
 }
 
 /// What the transaction needs from the host. The daemon implements it on the
@@ -157,6 +160,7 @@ pub fn update(host: &mut dyn Host, new: &Path, events: &mut dyn Events) -> Resul
     // decides whether anything regressed; a unit that was already broken
     // before the update is a warning, not a reason to roll back.
     let mut warnings = Vec::new();
+    events.stage(Stage::Activating);
     let failure = match host.switch(new, Action::Test, Some(&journal.failed_before), events) {
         Ok(Some(code)) => {
             let exit = (code != 0).then(|| exit_text(Action::Test, Some(code)));
@@ -180,6 +184,7 @@ pub fn update(host: &mut dyn Host, new: &Path, events: &mut dyn Events) -> Resul
         return Ok(rollback(host, &journal, failure, events));
     }
 
+    events.stage(Stage::Committing);
     journal.phase = Phase::Committing;
     let commit = host
         .write_journal(&journal)
@@ -241,6 +246,7 @@ fn health(
     new: &Path,
     events: &mut dyn Events,
 ) -> Result<Vec<String>, String> {
+    events.stage(Stage::HealthGate);
     host.settle(events);
     let mut problems = Vec::new();
     if host.current_system().as_deref() != Some(new) {
@@ -288,6 +294,7 @@ pub fn rollback(
     failure: String,
     events: &mut dyn Events,
 ) -> Outcome {
+    events.stage(Stage::RollingBack);
     let previous = &journal.previous_system;
     let mut problems = Vec::new();
     if let Err(error) = host.wait_switch_lock(events) {

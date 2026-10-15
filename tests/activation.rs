@@ -24,6 +24,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             writeln!(file, "{message}")?;
             return Ok(());
         }
+        // The progress reporter: one line per report.
+        "progress" => {
+            use std::io::Write;
+            let message = std::env::args().skip(2).collect::<Vec<_>>().join(" ");
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/root/progress-reports")?;
+            writeln!(file, "{message}")?;
+            return Ok(());
+        }
         // The failure reporter: one line per report.
         "report" => {
             use std::io::Write;

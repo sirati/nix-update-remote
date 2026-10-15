@@ -26,6 +26,10 @@ struct Plan {
     /// appended as the last argument. Empty: none.
     #[serde(default)]
     warning_command: Vec<String>,
+    /// Reports each stage of the update as it starts, and the upload's
+    /// percentage; `--text TEXT` and `--percent N` are appended. Empty: none.
+    #[serde(default)]
+    progress_command: Vec<String>,
     ssh_arguments: Vec<String>,
     copy_ssh_arguments: Vec<String>,
     reboot: bool,
@@ -129,6 +133,7 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     // Only closure switches commit with warnings.
     if plan.backend == "deploy" {
         child.args(reporter_arguments("warning", &plan.warning_command, &replacements));
+        child.args(reporter_arguments("progress", &plan.progress_command, &replacements));
     }
     for argument in ssh_arguments { child.arg("--ssh-arg").arg(argument); }
     if plan.reboot && !no_reboot { child.arg("--reboot"); }
@@ -154,5 +159,6 @@ mod tests {
         );
         assert!(reporter_arguments("failure", &[], &map).is_empty());
         assert_eq!(reporter_arguments("warning", &["/w".to_owned(), "{host}".into()], &map), ["--warning-command", "/w", "--warning-arg", "ns1"]);
+        assert_eq!(reporter_arguments("progress", &["/p".to_owned(), "{host}".into()], &map), ["--progress-command", "/p", "--progress-arg", "ns1"]);
     }
 }

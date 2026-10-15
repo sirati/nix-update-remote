@@ -27,6 +27,11 @@ struct Options {
     failure_args: Vec<String>,
     warning_command: Option<PathBuf>,
     warning_args: Vec<String>,
+    progress_command: Option<PathBuf>,
+    progress_args: Vec<String>,
+    /// Nix public keys whose existing signatures on closure paths are used
+    /// instead of asking the external signer again.
+    reuse_signature_keys: Vec<String>,
 }
 
 pub fn deploy(args: &[String]) -> Result<(), String> {
@@ -47,7 +52,13 @@ fn deploy_with(options: &Options) -> Result<(), String> {
     let roots = Roots::create()?;
     let system = build(&options, &roots.0.join("system"))?;
     if let Some(command) = &options.sign_command {
-        crate::closure_signing::sign(&system, &roots.0, command, &options.sign_args)?;
+        crate::closure_signing::sign(
+            &system,
+            &roots.0,
+            command,
+            &options.sign_args,
+            &options.reuse_signature_keys,
+        )?;
     } else {
         let mut signing = Command::new("nix");
         signing.args([
@@ -88,8 +99,12 @@ fn deploy_with(options: &Options) -> Result<(), String> {
     options.login_approval.before_connecting()?;
     let transport = Transport::connect(&options)?;
     let store = format!("{}?max-connections=1", store_uri(&options.target)?);
-    copy_closure(&system, &store, &transport)?;
-    apply(&options, &system, &transport)?;
+    let progress = crate::progress::Reporter::new(
+        options.progress_command.clone(),
+        options.progress_args.clone(),
+    );
+    copy_closure(&system, &store, &transport, &progress)?;
+    apply(&options, &system, &transport, &progress)?;
     if let Some(command) = &options.post_command {
         run(
             Command::new(command).args(&options.post_args),
@@ -99,8 +114,14 @@ fn deploy_with(options: &Options) -> Result<(), String> {
     Ok(())
 }
 
-fn copy_closure(system: &Path, store: &str, transport: &Transport) -> Result<(), String> {
-    run(
+fn copy_closure(
+    system: &Path,
+    store: &str,
+    transport: &Transport,
+    progress: &crate::progress::Reporter,
+) -> Result<(), String> {
+    progress.report("upload", "uploading the closure", Some(0));
+    crate::progress::copy(
         Command::new("nix")
             .args([
                 "--extra-experimental-features",
@@ -112,7 +133,9 @@ fn copy_closure(system: &Path, store: &str, transport: &Transport) -> Result<(),
             .arg(store)
             .arg(system),
         "copying closure",
+        progress,
     )?;
+    progress.report("upload", "uploading the closure signatures", Some(100));
     // Copy skips paths that are already valid on the destination. Those paths
     // still need the operator's signatures, including after a fresh install.
     run(
@@ -183,6 +206,9 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut failure_args = Vec::new();
     let mut warning_command = None;
     let mut warning_args = Vec::new();
+    let mut progress_command = None;
+    let mut progress_args = Vec::new();
+    let mut reuse_signature_keys = Vec::new();
     let mut login_approval = crate::login_approval::LoginApproval::default();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -235,6 +261,16 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--warning-arg" => {
                 warning_args.push(iter.next().ok_or("missing warning argument")?.clone())
             }
+            "--progress-command" => {
+                progress_command = Some(PathBuf::from(
+                    iter.next().ok_or("missing progress command")?,
+                ))
+            }
+            "--progress-arg" => {
+                progress_args.push(iter.next().ok_or("missing progress argument")?.clone())
+            }
+            "--reuse-signatures-by" => reuse_signature_keys
+                .push(iter.next().ok_or("missing signature key")?.clone()),
             _ => return Err(format!("unknown deploy argument: {arg}")),
         }
     }
@@ -244,6 +280,12 @@ fn parse(args: &[String]) -> Result<Options, String> {
     }
     if !warning_args.is_empty() && warning_command.is_none() {
         return Err("warning arguments require --warning-command".into());
+    }
+    if !progress_args.is_empty() && progress_command.is_none() {
+        return Err("progress arguments require --progress-command".into());
+    }
+    if !reuse_signature_keys.is_empty() && sign_command.is_none() {
+        return Err("--reuse-signatures-by requires --sign-command".into());
     }
     if !failure_args.is_empty() && failure_command.is_none() {
         return Err("failure arguments require --failure-command".into());
@@ -288,6 +330,9 @@ fn parse(args: &[String]) -> Result<Options, String> {
         failure_args,
         warning_command,
         warning_args,
+        progress_command,
+        progress_args,
+        reuse_signature_keys,
     })
 }
 
@@ -364,7 +409,12 @@ impl Drop for ApplyChild {
 /// brokers send keepalives; older ones are silent until their verdict.
 const SILENCE_LIMIT: Duration = Duration::from_secs(600);
 
-fn apply(options: &Options, system: &Path, transport: &Transport) -> Result<(), String> {
+fn apply(
+    options: &Options,
+    system: &Path,
+    transport: &Transport,
+    progress: &crate::progress::Reporter,
+) -> Result<(), String> {
     let target = &options.target;
     let mut child = ApplyChild(
         Command::new("ssh")
@@ -389,6 +439,7 @@ fn apply(options: &Options, system: &Path, transport: &Transport) -> Result<(), 
         &mut || activation_callback(options),
         &mut |message| report_failure(options, message),
         &mut |message| report_warning(options, message),
+        &mut |stage| progress.stage(stage),
         SILENCE_LIMIT,
     )?;
     let status = child.0.wait().map_err(|error| error.to_string())?;
@@ -451,6 +502,7 @@ fn follow(
     start: &mut dyn FnMut() -> Result<Option<Box<dyn Running>>, String>,
     report: &mut dyn FnMut(&str),
     warn: &mut dyn FnMut(&str),
+    stage: &mut dyn FnMut(protocol::Stage),
     silence_limit: Duration,
 ) -> Result<(), String> {
     use protocol::SwitchLine;
@@ -459,6 +511,7 @@ fn follow(
     let mut failed = false;
     let mut running: Option<Box<dyn Running>> = None;
     let mut callback: Option<Result<(), String>> = None;
+    let mut last_stage = None;
     let mut last = Instant::now();
     let callback_failed = || Err("configuration activation operation failed".to_owned());
     loop {
@@ -493,6 +546,7 @@ fn follow(
                 ));
             }
         };
+        let entered = line.stage();
         match line {
             SwitchLine::Activated(path) if path == system && !activated => {
                 activated = true;
@@ -508,7 +562,13 @@ fn follow(
                 running = None;
                 report(&format!("activation failed, the host is rolling back: {reason}"));
             }
-            SwitchLine::Waiting => {}
+            SwitchLine::Waiting(_) => {
+                // The login helper and the broker both verify.
+                if let Some(entered) = entered.filter(|entered| last_stage != Some(*entered)) {
+                    last_stage = Some(entered);
+                    stage(entered);
+                }
+            }
             SwitchLine::Warning(text) => {
                 eprintln!("nix-update-remote: warning: {text}");
                 warnings.push(text);
@@ -728,12 +788,12 @@ mod tests {
             0o700
         );
         let store = format!("{}?max-connections=1", store_uri(&target).unwrap());
-        copy_closure(&system, &store, &transport).unwrap();
+        copy_closure(&system, &store, &transport, &crate::progress::Reporter::new(None, Vec::new())).unwrap();
         let mut master = transport.master.take().unwrap();
         master.kill().unwrap();
         master.wait().unwrap();
         assert!(
-            copy_closure(&system, &store, &transport).is_err(),
+            copy_closure(&system, &store, &transport, &crate::progress::Reporter::new(None, Vec::new())).is_err(),
             "lost master silently opened another connection"
         );
         let status = Command::new("ssh")
@@ -770,6 +830,7 @@ mod tests {
             },
             &mut |_| panic!("nothing failed"),
             &mut |_| panic!("no warning"),
+            &mut |_| {},
             SILENCE_LIMIT,
         );
         assert_eq!(result, Ok(()));
@@ -839,9 +900,48 @@ mod tests {
             &mut probe.starter(outcome),
             &mut |message| reports.borrow_mut().push(message.to_owned()),
             &mut |message| reports.borrow_mut().push(format!("WARN {message}")),
+            &mut |stage| reports.borrow_mut().push(format!("STAGE {}", stage.word())),
             Duration::from_millis(300),
         );
         (result, probe, reports.into_inner())
+    }
+
+    #[test]
+    fn each_host_stage_reaches_the_operator_once_as_it_starts() {
+        let (result, _, reports) = drive(
+            &[
+                "WAITING stage verifying",
+                "WAITING stage verifying",
+                "WAITING stage activating",
+                "WAITING switch-to-configuration test",
+                "ACTIVATED /nix/store/test-system",
+                "WAITING stage health-gate",
+                "WAITING checking the system health",
+                "WAITING stage committing",
+                "OK /nix/store/test-system",
+            ],
+            false,
+            Some(true),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            reports,
+            ["STAGE verifying", "STAGE activating", "STAGE health-gate", "STAGE committing"]
+        );
+        let (result, _, reports) = drive(
+            &[
+                "WAITING stage activating",
+                "FAILED status 4",
+                "WAITING stage rolling-back",
+                "ROLLED-BACK status 4; restored",
+            ],
+            false,
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(reports[0], "STAGE activating");
+        assert!(reports[1].contains("rolling back: status 4"), "{reports:?}");
+        assert_eq!(reports[2], "STAGE rolling-back");
     }
 
     #[test]
@@ -873,6 +973,7 @@ mod tests {
                 &lines,
                 Path::new("/nix/store/test-system"),
                 &mut watched.starter(None),
+                &mut |_| {},
                 &mut |_| {},
                 &mut |_| {},
                 SILENCE_LIMIT,
@@ -977,6 +1078,7 @@ mod tests {
             &lines,
             Path::new("/nix/store/test-system"),
             &mut probe.delayed(Some(true), Duration::from_millis(600)),
+            &mut |_| {},
             &mut |_| {},
             &mut |_| {},
             Duration::from_millis(300),

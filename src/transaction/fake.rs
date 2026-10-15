@@ -249,7 +249,7 @@ impl Host for FakeHost {
 
 /// Records what a client would have been told.
 #[derive(Default)]
-pub struct Recorder(pub Vec<String>);
+pub struct Recorder(pub Vec<String>, pub Vec<super::Stage>);
 
 impl Events for Recorder {
     fn activated(&mut self, system: &Path) {
@@ -261,5 +261,8 @@ impl Events for Recorder {
     fn waiting(&mut self, _: &str) {}
     fn warning(&mut self, text: &str) {
         self.0.push(format!("WARNING {text}"));
+    }
+    fn stage(&mut self, stage: super::Stage) {
+        self.1.push(stage);
     }
 }

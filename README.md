@@ -48,6 +48,14 @@ signature per path. The requester supplies this metadata. The protocol does
 not transfer or verify NAR contents. Nix imports the signatures through its
 metadata-only cache operation.
 
+With repeated `--reuse-signatures-by NAME:KEY`, the external signer is asked
+only for closure paths that do not already carry a signature by one of these
+public keys that verifies against the path's fingerprint. A closure that was
+signed before is not signed again. This is sound because a Nix signature
+covers the store path, NAR hash, NAR size and references, not one deployment:
+an earlier signature authorizes exactly what a new one would, and it already
+lets that closure be deployed. The host still verifies every path itself.
+
 A structured `--key-command` with repeated `--key-arg` values can also supply
 the key through a pipe. `keygen NAME` generates an operator key. It writes the
 private half to stdout and the public half to descriptor 3, and writes neither
@@ -234,6 +242,24 @@ every failure as soon as it is known, with the reason as the last argument. A
 configured plan sets this with `failureCommand`. Warnings of an update that
 committed go to `--warning-command` with repeated `--warning-arg` (plan:
 `warningCommand`) in the same way.
+
+`WAITING stage WORD` announces each stage on the host as it starts:
+`verifying`, `activating`, `health-gate`, `committing` or `rolling-back`.
+Clients that predate stages read it as a keepalive. With `--progress-command
+PROGRAM` and repeated `--progress-arg ARG` (plan: `progressCommand`), the
+client reports the closure upload with its percentage of paths and bytes
+from Nix's progress events, then each stage, by appending `--text TEXT` and,
+for the upload, `--percent N`. Reports run one at a time on their own
+thread and never hold up or change the update.
+
+The broker only accepts the login program that sshd runs for the update
+account under the current system, its own binary. If the system changed
+without restarting the broker (a switch outside the updater, or the rollback
+of an interrupted switch when the broker starts), the broker answers `RETRY`
+with both binaries named and restarts into the current updater; the login
+program sends its request again to the new broker. A broker whose service
+starts a binary other than the current login program refuses every login
+with a message that names both.
 
 An integration may supply `--post-command PROGRAM` with repeated `--post-arg ARG`
 for operator work after an update. With `--reboot`, the generation workflow waits

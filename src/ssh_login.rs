@@ -63,14 +63,61 @@ fn proxy_apply() -> Result<(), String> {
             return Err(error);
         }
     };
-    let mut socket = UnixStream::connect(protocol::SOCKET).map_err(|error| error.to_string())?;
-    socket
-        .write_all(&request)
-        .map_err(|error| error.to_string())?;
-    socket
-        .shutdown(Shutdown::Write)
-        .map_err(|error| error.to_string())?;
-    relay_apply_response(&mut socket, &mut io::stdout(), &system)
+    let (first, mut socket) = send_apply_request(Path::new(protocol::SOCKET), &request, RETRY_LIMIT)?;
+    relay_apply_response(
+        &mut io::Cursor::new(format!("{first}\n")).chain(&mut socket),
+        &mut io::stdout(),
+        &system,
+    )
+}
+
+/// How long a login waits for a broker that restarts into the current
+/// system's updater.
+const RETRY_LIMIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Sends `request` to the broker and returns its first response line and
+/// the rest of its response. A broker that answers `RETRY` restarts into
+/// the updater of the current system; the request goes again to the new
+/// broker until `limit` passes.
+fn send_apply_request(
+    socket_path: &Path,
+    request: &[u8],
+    limit: std::time::Duration,
+) -> Result<(String, UnixStream), String> {
+    let deadline = std::time::Instant::now() + limit;
+    let mut retry_reason = None;
+    loop {
+        let attempt = (|| {
+            let mut socket = UnixStream::connect(socket_path).map_err(|error| error.to_string())?;
+            // A broker that answers RETRY may close before it read the
+            // request; its answer is still there to read.
+            let sent = socket
+                .write_all(request)
+                .and_then(|()| socket.shutdown(Shutdown::Write));
+            match protocol::read_control_line(&mut socket) {
+                Ok(first) => Ok((first, socket)),
+                Err(error) => Err(sent.err().map_or(error, |sent| sent.to_string())),
+            }
+        })();
+        match attempt {
+            Ok((first, socket)) => match first.strip_prefix(protocol::RETRY) {
+                Some(reason) if reason.is_empty() || reason.starts_with(' ') => {
+                    retry_reason = Some(reason.trim_start().to_owned());
+                }
+                _ => return Ok((first, socket)),
+            },
+            // Between two brokers the socket is briefly gone.
+            Err(error) if retry_reason.is_none() => return Err(error),
+            Err(_) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the update broker did not come back on the current updater: {}",
+                retry_reason.unwrap_or_default()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
 }
 
 /// The request and its system, verified with the update account's trust
@@ -84,6 +131,11 @@ fn checked_apply_request() -> Result<(Vec<u8>, std::path::PathBuf), String> {
     let request_text = std::str::from_utf8(&request).map_err(|_| "request is not UTF-8")?;
     let requested = protocol::parse_request(request_text)?;
     let system = verify::system(&requested)?;
+    let mut stdout = io::stdout();
+    stdout
+        .write_all(protocol::Stage::Verifying.line().as_bytes())
+        .and_then(|()| stdout.flush())
+        .map_err(|error| error.to_string())?;
     let (static_keys, runtime_keys) = trust_from_environment()?;
     verify::closure(
         Path::new("/run/current-system/sw/bin/nix"),
@@ -236,5 +288,67 @@ mod rollback_relay_tests {
         ] {
             assert!(relay_apply_response(&mut &bytes[..], &mut Vec::new(), Path::new("/nix/store/test-system")).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
+    fn socket_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nur-retry-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    /// A broker that answers RETRY and goes away, then its successor.
+    #[test]
+    fn a_login_sends_its_request_again_to_the_restarted_broker() {
+        let dir = socket_dir();
+        let path = dir.join("control.sock");
+        let old = UnixListener::bind(&path).unwrap();
+        let broker_path = path.clone();
+        let broker = std::thread::spawn(move || {
+            let (mut stream, _) = old.accept().unwrap();
+            stream.write_all(b"RETRY the update daemon runs /a, but the update login of the current system is /b\n").unwrap();
+            drop(stream);
+            drop(old);
+            std::fs::remove_file(&broker_path).unwrap();
+            std::thread::sleep(Duration::from_millis(600));
+            let new = UnixListener::bind(&broker_path).unwrap();
+            let (mut stream, _) = new.accept().unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            stream.write_all(b"OK /nix/store/test-system\n").unwrap();
+            request
+        });
+        let (first, _) = send_apply_request(&path, b"REQUEST\n", Duration::from_secs(10)).unwrap();
+        assert_eq!(first, "OK /nix/store/test-system");
+        assert_eq!(broker.join().unwrap(), b"REQUEST\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_broker_that_never_comes_back_names_both_binaries() {
+        let dir = socket_dir();
+        let path = dir.join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let _ = stream.unwrap().write_all(b"RETRY the update daemon runs /a, but the update login of the current system is /b\n");
+            }
+        });
+        let error = send_apply_request(&path, b"REQUEST\n", Duration::from_millis(800)).unwrap_err();
+        assert!(error.contains("runs /a") && error.contains("system is /b"), "{error}");
+        // Without a broker the login fails at once, as before.
+        assert!(send_apply_request(&dir.join("missing"), b"REQUEST\n", Duration::from_secs(60)).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

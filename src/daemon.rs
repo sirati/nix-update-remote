@@ -85,6 +85,9 @@ impl Events for StreamEvents<'_> {
     fn warning(&mut self, text: &str) {
         self.line(format!("WARNING {}\n", protocol::one_line(text)));
     }
+    fn stage(&mut self, stage: transaction::Stage) {
+        self.line(stage.line());
+    }
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -92,6 +95,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     if !rustix::process::geteuid().is_root() {
         return Err("daemon role must run as root".into());
     }
+    let mut follow = Follow::start(&options);
     if options.artifact_prepare.is_none() {
         // A switch that an earlier daemon left unfinished is undone before
         // the next update can start.
@@ -101,17 +105,170 @@ pub fn run(args: &[String]) -> Result<(), String> {
             record_event(&options, &journal.new_system, "after", result);
         }
     }
+    // The rollback may have left a system with another updater.
+    follow.check(&options);
     protocol::remove_stale_socket(&options.socket)?;
     let listener = UnixListener::bind(&options.socket).map_err(|error| error.to_string())?;
     fs::set_permissions(&options.socket, fs::Permissions::from_mode(0o660))
         .map_err(|error| error.to_string())?;
     for connection in listener.incoming() {
         match connection {
-            Ok(stream) => handle(stream, &options),
+            Ok(stream) => {
+                handle(stream, &options, &mut follow);
+                follow.check(&options);
+            }
             Err(error) => eprintln!("nix-update-remote: accept failed: {error}"),
         }
     }
     Ok(())
+}
+
+/// The update account's login program comes from here: sshd runs the shell
+/// it names, so it is the updater of the current system.
+const PASSWD: &str = "/etc/passwd";
+
+/// The login shell `passwd` gives the account with `uid`.
+fn login_shell(passwd: &str, uid: u32) -> Result<PathBuf, String> {
+    let shell = passwd
+        .lines()
+        .map(|line| line.split(':').collect::<Vec<_>>())
+        .find(|fields| fields.len() == 7 && fields[2].parse::<u32>().ok() == Some(uid))
+        .map(|fields| PathBuf::from(fields[6]))
+        .ok_or_else(|| format!("{PASSWD} has no account with UID {uid}"))?;
+    if !shell.is_absolute() {
+        return Err(format!("the login shell of UID {uid} is not an absolute path"));
+    }
+    Ok(shell)
+}
+
+/// The daemon runs another binary than the login program of the current
+/// system, so the peer check refuses every login helper. That happens when
+/// the system changed without restarting the daemon: a switch outside the
+/// updater, or the rollback of an interrupted switch at start.
+struct Skew {
+    running: PathBuf,
+    current: PathBuf,
+}
+
+impl Skew {
+    fn of(update_uid: u32) -> Result<Option<Skew>, String> {
+        let passwd = fs::read_to_string(PASSWD).map_err(|e| format!("{PASSWD}: {e}"))?;
+        let helper = login_shell(&passwd, update_uid)?;
+        let current = fs::metadata(&helper).map_err(|e| format!("{}: {e}", helper.display()))?;
+        let own = fs::metadata("/proc/self/exe").map_err(|e| e.to_string())?;
+        if (own.dev(), own.ino()) == (current.dev(), current.ino()) {
+            return Ok(None);
+        }
+        Ok(Some(Skew {
+            running: fs::read_link("/proc/self/exe").unwrap_or_else(|_| "an unknown binary".into()),
+            current: fs::canonicalize(&helper).unwrap_or(helper),
+        }))
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "the update daemon runs {}, but the update login of the current system is {}",
+            self.running.display(),
+            self.current.display()
+        )
+    }
+}
+
+/// Keeps the daemon on the updater binary of the current system.
+struct Follow {
+    /// The service started this binary although it is not the current
+    /// system's; restarting it would start the same one again.
+    stuck: bool,
+    restart_requested: bool,
+}
+
+impl Follow {
+    fn start(options: &Options) -> Self {
+        let stuck = match Skew::of(options.update_uid) {
+            Ok(Some(skew)) => {
+                eprintln!(
+                    "nix-update-remote: {}; nix-update-remote.service does not start the current system's updater, \
+                     so every update login will be refused",
+                    skew.describe()
+                );
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                eprintln!("nix-update-remote: cannot compare with the current system's updater: {error}");
+                false
+            }
+        };
+        Self { stuck, restart_requested: false }
+    }
+
+    /// The skew, if the daemon must not serve updates as it is.
+    fn skew(&self, options: &Options) -> Option<Skew> {
+        Skew::of(options.update_uid).ok().flatten()
+    }
+
+    /// Restarts into the current system's updater when the system changed
+    /// under this daemon. Returns whether a restart is on its way.
+    fn check(&mut self, options: &Options) -> bool {
+        if self.restart_requested {
+            return true;
+        }
+        if self.stuck {
+            return false;
+        }
+        let Some(skew) = self.skew(options) else {
+            return false;
+        };
+        eprintln!("nix-update-remote: {}; restarting into the current updater", skew.describe());
+        match &options.restart_command {
+            Some(command) => match verify::checked(
+                Command::new(command).args(&options.restart_args),
+                "requesting broker restart",
+            ) {
+                Ok(()) => self.restart_requested = true,
+                Err(error) => {
+                    eprintln!("nix-update-remote: {error}");
+                    self.stuck = true;
+                }
+            },
+            // The service manager restarts a daemon that failed.
+            None => std::process::exit(1),
+        }
+        self.restart_requested
+    }
+
+    /// Answers a login helper that reached a daemon on the wrong binary:
+    /// `RETRY` while the daemon restarts into the current updater, else a
+    /// rejection that names both binaries. Returns whether it answered.
+    fn answer(&mut self, stream: &mut UnixStream, options: &Options) -> bool {
+        let Some(skew) = self.skew(options) else {
+            return false;
+        };
+        // The restart stops this daemon at once, so the answer goes first.
+        let restart = self.restart_requested || !self.stuck;
+        let line = if restart {
+            format!("{} {}; restarting into the current updater\n", protocol::RETRY, protocol::one_line(&skew.describe()))
+        } else {
+            format!(
+                "REJECTED {}\n",
+                protocol::one_line(&format!(
+                    "{}; restart nix-update-remote.service and make it run the current system's updater",
+                    skew.describe()
+                ))
+            )
+        };
+        eprintln!("nix-update-remote: refused an update login: {}", skew.describe());
+        // Closing with the request unread would reset the connection before
+        // the login helper reads the answer.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = (&mut *stream).take(protocol::MAX_REQUEST).read_to_end(&mut Vec::new());
+        let _ = stream.write_all(line.as_bytes());
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        if restart {
+            self.check(options);
+        }
+        true
+    }
 }
 
 fn parse(args: &[String]) -> Result<Options, String> {
@@ -321,10 +478,14 @@ fn report_outcome(outcome: &Outcome) -> &'static str {
     }
 }
 
-fn handle(mut stream: UnixStream, options: &Options) {
+fn handle(mut stream: UnixStream, options: &Options, follow: &mut Follow) {
     let previous_system = fs::read_link("/run/current-system").ok();
     // A stalled client must not hold up the transaction.
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    // The peer check below would refuse the current login helper.
+    if update_account_peer(&stream, options.update_uid) && follow.answer(&mut stream, options) {
+        return;
+    }
     let (reply, switch) = apply_request(&mut stream, options);
     let response = match &reply {
         Reply::Switched(path, _) => format!("OK {}\n", path.display()),
@@ -357,14 +518,22 @@ fn handle(mut stream: UnixStream, options: &Options) {
         // helper and broker configuration. Refresh after replying in that
         // case too, so a retry uses matching binaries.
         if let Some(command) = &options.restart_command {
-            if let Err(error) = verify::checked(
+            match verify::checked(
                 Command::new(command).args(&options.restart_args),
                 "requesting broker restart",
             ) {
-                eprintln!("nix-update-remote: {error}");
+                Ok(()) => follow.restart_requested = true,
+                Err(error) => eprintln!("nix-update-remote: {error}"),
             }
         }
     }
+}
+
+/// Whether the peer runs as the update account; only its logins may make
+/// the daemon restart.
+fn update_account_peer(stream: &UnixStream, expected_uid: u32) -> bool {
+    rustix::net::sockopt::socket_peercred(stream)
+        .is_ok_and(|credentials| credentials.uid.as_raw() == expected_uid)
 }
 
 /// Returns the reply and whether the request was a closure switch.
@@ -399,6 +568,7 @@ fn verified_switch_request(stream: &mut UnixStream, options: &Options) -> Result
     authenticate_peer(stream, options.update_uid)?;
     let tail = String::from_utf8(bytes).map_err(|_| "request is not UTF-8")?;
     let requested = protocol::parse_request(&format!("{}\nSWITCH\n{tail}", protocol::MAGIC))?;
+    StreamEvents(stream).stage(transaction::Stage::Verifying);
     let resolved = verify::system(&requested)?;
     verify::closure(
         &options.nix,
@@ -520,10 +690,18 @@ fn authenticate_peer(stream: &UnixStream, expected_uid: u32) -> Result<(), Strin
         return Err("control peer has the wrong UID".into());
     }
     let peer_exe = PathBuf::from(format!("/proc/{}/exe", credentials.pid.as_raw_nonzero()));
-    let peer = fs::metadata(peer_exe).map_err(|error| error.to_string())?;
+    let peer = fs::metadata(&peer_exe).map_err(|error| error.to_string())?;
     let own = fs::metadata("/proc/self/exe").map_err(|error| error.to_string())?;
     if peer.dev() != own.dev() || peer.ino() != own.ino() {
-        return Err("control peer is not this updater binary".into());
+        let name = |path: &Path| {
+            fs::read_link(path).map_or_else(|_| "an unknown binary".to_owned(), |p| p.display().to_string())
+        };
+        return Err(format!(
+            "control peer {} is not this updater binary {}; a login that started before the last \
+             switch must reconnect",
+            name(&peer_exe),
+            name(Path::new("/proc/self/exe"))
+        ));
     }
     Ok(())
 }
@@ -532,6 +710,14 @@ fn authenticate_peer(stream: &UnixStream, expected_uid: u32) -> Result<(), Strin
 mod tests {
     use super::*;
     use crate::transaction::fake::{FakeHost, path, system};
+
+    #[test]
+    fn the_current_updater_is_the_login_shell_of_the_update_account() {
+        let passwd = "root:x:0:0::/root:/run/current-system/sw/bin/bash\nupdate:x:2990:2990::/var/empty:/nix/store/aaa-nix-update-remote/bin/nix-update-remote\n";
+        assert_eq!(login_shell(passwd, 2990).unwrap(), Path::new("/nix/store/aaa-nix-update-remote/bin/nix-update-remote"));
+        assert!(login_shell(passwd, 2991).is_err());
+        assert!(login_shell("update:x:2990:2990::/var/empty:relative\n", 2990).is_err());
+    }
 
     #[test]
     fn a_vanished_client_does_not_stop_the_switch_or_its_rollback() {

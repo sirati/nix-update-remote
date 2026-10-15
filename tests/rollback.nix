@@ -14,6 +14,12 @@ let
   hook = fixture "update-hook-fixture" ./hook.rs "";
   boot = fixture "boot-fixture" ./boot.rs "";
   failingBoot = fixture "boot-fixture" ./boot.rs "--cfg failing_install";
+  # The same updater under another store path: a system whose update login
+  # is another binary than the one the daemon started with.
+  skewedUpdater = pkgs.runCommand "nix-update-remote-skewed" { meta.mainProgram = "nix-update-remote"; } ''
+    mkdir -p $out/bin
+    cp ${updater}/bin/nix-update-remote $out/bin/
+  '';
   generation = name: { environment.etc."rollback-generation".text = name; };
   # Specialisations inherit the base text; theirs replaces it.
   baseGeneration = { lib, ... }: { environment.etc."rollback-generation".text = lib.mkDefault "base"; };
@@ -82,7 +88,14 @@ in
         };
         stuck.configuration = {
           imports = [ (generation "stuck") ];
+          # A daemon restarted mid-switch starts this updater; the rollback
+          # brings back the previous one.
+          services.nixUpdateRemote.package = skewedUpdater;
           systemd.services.stuck-gate = gate "/run/stuck-gate-never";
+        };
+        skew.configuration = {
+          imports = [ (generation "skew") ];
+          services.nixUpdateRemote.package = skewedUpdater;
         };
         slow.configuration = {
           imports = [ (generation "slow") ];
@@ -106,7 +119,7 @@ in
     def spec(name):
       return machine.succeed(f"readlink -f /run/current-system/specialisation/{name}").strip()
     base = machine.succeed("readlink -f /run/current-system").strip()
-    systems = {name: spec(name) for name in ["good", "broken", "bootfail", "stuck", "slow", "stillbroken"]}
+    systems = {name: spec(name) for name in ["good", "broken", "bootfail", "stuck", "slow", "stillbroken", "skew"]}
 
     machine.succeed("install -d -m 0700 /run/update-ssh")
     client.succeed(
@@ -136,6 +149,7 @@ in
         "--activation-command ${activation}/bin/update-activation-fixture --activation-arg secrets "
         "--failure-command ${activation}/bin/update-activation-fixture --failure-arg report "
         "--warning-command ${activation}/bin/update-activation-fixture --warning-arg warn "
+        "--progress-command ${activation}/bin/update-activation-fixture --progress-arg progress "
         f"{extra}"
       )
 
@@ -155,12 +169,33 @@ in
       assert failed == ["already-broken.service"], failed
 
     def reset_client():
-      client.succeed("rm -f /root/failure-reports /root/warning-reports /root/secrets-started /root/secrets-deployed /root/secrets-approve")
+      client.succeed("rm -f /root/failure-reports /root/warning-reports /root/progress-reports /root/secrets-started /root/secrets-deployed /root/secrets-approve")
 
     def events():
       machine.succeed("systemctl start system-update-report-delivery.service")
       machine.wait_until_succeeds("test $(systemctl show system-update-report-delivery.service -p ActiveState --value) = inactive")
       return machine.succeed("cat /tmp/update-hook-events 2>/dev/null || true").splitlines()
+
+    verifying = "verifying the closure signatures on the host"
+    activating = "activating the new system"
+    health = "checking the health of the new system"
+    committing = "committing the new system to the profile and bootloader"
+    rolling_back = "rolling back to the previous system"
+
+    def assert_progress(*stages):
+      lines = client.succeed("cat /root/progress-reports").splitlines()
+      # The upload comes first, with its percentage.
+      assert lines[0] == "--text uploading the closure --percent 0", lines
+      assert any(line.endswith(" --percent 100") for line in lines), lines
+      texts = [line.removeprefix("--text ") for line in lines if " --percent " not in line]
+      assert texts == list(stages), lines
+
+    # The daemon runs the updater that the update login of the current
+    # system runs.
+    same_updater = (
+      "test \"$(readlink /proc/$(systemctl show -p MainPID --value nix-update-remote.service)/exe)\" = "
+      "\"$(readlink -f $(getent passwd update | cut -d: -f7))\""
+    )
 
     with subtest("a closure without a trusted signature changes nothing"):
       before = state()
@@ -169,6 +204,7 @@ in
       assert state() == before, state()
       client.succeed("test ! -e /root/secrets-started")
       client.succeed("grep -F 'host is unchanged' /root/failure-reports")
+      assert_progress(verifying)
       assert_reachable_and_clean()
       reset_client()
 
@@ -179,6 +215,7 @@ in
       output = client.fail(deploy("broken") + " 2>&1", timeout=90)
       assert "rolled back" in output and "broken-on-start.service" in output, output
       assert "units failed during activation" in output, output
+      assert_progress(verifying, activating, rolling_back)
       assert state() == before, state()
       assert before["etc"] == "base"
       # The secret deployment had started and was stopped before it ran.
@@ -199,6 +236,7 @@ in
       assert good["current"] == systems["good"] and good["etc"] == "good", good
       assert machine.succeed("readlink -f /nix/var/nix/profiles/system").strip() == systems["good"]
       assert good["boot"] == systems["good"], good
+      assert_progress(verifying, activating, health, committing)
       client.succeed("test -e /root/secrets-deployed")
       assert_reachable_and_clean()
       reset_client()
@@ -231,6 +269,9 @@ in
       machine.succeed("journalctl -u nix-update-remote.service -o cat | grep -F 'update daemon was interrupted'")
       machine.wait_for_unit("nix-update-remote.service")
       assert_reachable_and_clean()
+      # The interrupted switch had started the updater of the new system;
+      # after its rollback the daemon runs the previous one again.
+      machine.wait_until_succeeds(same_updater, timeout=60)
       assert f"after rolled-back {systems['stuck']}" in events()
       reset_client()
 
@@ -266,6 +307,25 @@ in
       client.succeed("test ! -e /root/failure-reports")
       client.succeed("test -e /root/secrets-deployed")
       assert f"after success {systems['stillbroken']}" in events()
+      assert_reachable_and_clean()
+
+    with subtest("after a switch outside the updater, the daemon follows the new update login"):
+      reset_client()
+      client.succeed("touch /root/secrets-approve")
+      # As on ns1: the system changes without the daemon, which keeps the
+      # updater it started with, while sshd runs the new system's login.
+      machine.succeed(f"{systems['skew']}/bin/switch-to-configuration test || true")
+      assert machine.succeed("readlink /run/current-system").strip() == systems["skew"]
+      machine.fail(same_updater)
+      client.succeed(deploy("good"))
+      updated = state()
+      assert updated["current"] == systems["good"] and updated["boot"] == systems["good"], updated
+      # The daemon named both binaries and restarted; the login went on.
+      machine.succeed(
+        "journalctl -u nix-update-remote.service -o cat | grep -F 'restarting into the current updater' "
+        "| grep -F 'the update login of the current system is /nix/store/' | grep -F nix-update-remote-skewed"
+      )
+      machine.wait_until_succeeds(same_updater, timeout=60)
       assert_reachable_and_clean()
 
     with subtest("the broker can write /boot; a sandboxed transient unit cannot"):

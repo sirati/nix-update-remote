@@ -143,7 +143,7 @@ in
     )
     machine.succeed(
       "journalctl -u nix-update-remote.service --no-pager | "
-      "grep -F 'control peer is not this updater binary'"
+      "grep -E 'control peer \\S+python\\S* is not this updater binary \\S+nix-update-remote'"
     )
 
     ssh_common = (

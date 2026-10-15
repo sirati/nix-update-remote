@@ -139,7 +139,9 @@ pub fn one_line(text: &str) -> String {
 pub enum SwitchLine {
     Activated(PathBuf),
     Failed(String),
-    Waiting,
+    /// Still working. Its text is free, except that `stage WORD` announces
+    /// the [`Stage`] the host enters; clients that predate stages ignore it.
+    Waiting(String),
     /// Committed, but the operator must see this.
     Warning(String),
     Ok(PathBuf),
@@ -155,7 +157,7 @@ impl SwitchLine {
         Ok(match word {
             "ACTIVATED" => SwitchLine::Activated(PathBuf::from(rest)),
             "FAILED" => SwitchLine::Failed(rest.to_owned()),
-            "WAITING" => SwitchLine::Waiting,
+            "WAITING" => SwitchLine::Waiting(rest.to_owned()),
             "WARNING" => SwitchLine::Warning(rest.to_owned()),
             "OK" => SwitchLine::Ok(PathBuf::from(rest)),
             "REJECTED" => SwitchLine::Rejected(rest.to_owned()),
@@ -169,8 +171,16 @@ impl SwitchLine {
     pub fn is_final(&self) -> bool {
         !matches!(
             self,
-            SwitchLine::Activated(_) | SwitchLine::Failed(_) | SwitchLine::Waiting | SwitchLine::Warning(_)
+            SwitchLine::Activated(_) | SwitchLine::Failed(_) | SwitchLine::Waiting(_) | SwitchLine::Warning(_)
         )
+    }
+
+    /// The stage a `WAITING stage WORD` line announces.
+    pub fn stage(&self) -> Option<Stage> {
+        match self {
+            SwitchLine::Waiting(text) => text.strip_prefix("stage ").and_then(Stage::parse),
+            _ => None,
+        }
     }
 
     /// What the operator is told about a final line other than `OK`.
@@ -188,6 +198,68 @@ impl SwitchLine {
     }
 }
 
+/// What the host does with an update, as it starts doing it. The broker
+/// announces each stage in a `WAITING stage WORD` line, which a client that
+/// predates stages takes for a keepalive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// Checking the closure's signatures by an update key.
+    Verifying,
+    /// `switch-to-configuration test` of the new system.
+    Activating,
+    /// The health gate of the new system.
+    HealthGate,
+    /// Setting the profile and the bootloader to the new system.
+    Committing,
+    /// Restoring the previous system.
+    RollingBack,
+}
+
+impl Stage {
+    pub const ALL: [Stage; 5] = [
+        Stage::Verifying,
+        Stage::Activating,
+        Stage::HealthGate,
+        Stage::Committing,
+        Stage::RollingBack,
+    ];
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Stage::Verifying => "verifying",
+            Stage::Activating => "activating",
+            Stage::HealthGate => "health-gate",
+            Stage::Committing => "committing",
+            Stage::RollingBack => "rolling-back",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|stage| stage.word() == word)
+    }
+
+    /// The line that announces this stage.
+    pub fn line(self) -> String {
+        format!("WAITING stage {}\n", self.word())
+    }
+
+    /// What the operator reads.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Stage::Verifying => "verifying the closure signatures on the host",
+            Stage::Activating => "activating the new system",
+            Stage::HealthGate => "checking the health of the new system",
+            Stage::Committing => "committing the new system to the profile and bootloader",
+            Stage::RollingBack => "rolling back to the previous system",
+        }
+    }
+}
+
+/// The broker's first line when it does not run the current system's
+/// updater: it restarts into that updater, and the login helper sends the
+/// request again.
+pub const RETRY: &str = "RETRY";
+
 #[cfg(test)]
 mod switch_line_tests {
     use super::*;
@@ -202,6 +274,13 @@ mod switch_line_tests {
         assert!(SwitchLine::parse("ROLLED-BACK x").unwrap().failure().unwrap().contains("rolled back: x"));
         assert!(SwitchLine::parse("REJECTED x").unwrap().failure().unwrap().contains("unchanged"));
         assert!(!SwitchLine::parse("FAILED x").unwrap().is_final());
+        for stage in Stage::ALL {
+            let parsed = SwitchLine::parse(stage.line().trim_end()).unwrap();
+            assert!(!parsed.is_final());
+            assert_eq!(parsed.stage(), Some(stage));
+        }
+        assert_eq!(SwitchLine::parse("WAITING switch-to-configuration test").unwrap().stage(), None);
+        assert_eq!(SwitchLine::parse("WAITING stage dancing").unwrap().stage(), None);
         assert_eq!(SwitchLine::parse("WARNING a.service").unwrap(), SwitchLine::Warning("a.service".into()));
         assert!(!SwitchLine::parse("WARNING a").unwrap().is_final());
         assert!(SwitchLine::parse("SOMETHING").is_err());
