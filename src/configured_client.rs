@@ -30,6 +30,12 @@ struct Plan {
     /// percentage; `--text TEXT` and `--percent N` are appended. Empty: none.
     #[serde(default)]
     progress_command: Vec<String>,
+    /// Asks the operator to confirm a deployment from a working tree with
+    /// uncommitted changes; `--reason TEXT` and one `--item FILE` per dirty
+    /// file are appended, and only exit status 0 confirms. Empty: ask on
+    /// the terminal.
+    #[serde(default)]
+    confirm_command: Vec<String>,
     ssh_arguments: Vec<String>,
     copy_ssh_arguments: Vec<String>,
     reboot: bool,
@@ -62,9 +68,9 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--help" => { println!("configured-deploy --installable FLAKE#CONFIG --plan FILE [--target-host update@HOST] [--ssh-port PORT] [--known-hosts FILE] [--no-reboot]"); return Ok(()); }
+            "--help" => { println!("configured-deploy --installable FLAKE#CONFIG --plan FILE [--target-host update@HOST] [--ssh-port PORT] [--known-hosts FILE] [--git GIT] [--no-reboot]"); return Ok(()); }
             "--no-reboot" => no_reboot = true,
-            "--installable" | "--plan" | "--nix" | "--target-host" | "--ssh-port" | "--known-hosts" => { values.insert(arg.as_str(), iter.next().ok_or("missing configured update option value")?.clone()); }
+            "--installable" | "--plan" | "--nix" | "--git" | "--target-host" | "--ssh-port" | "--known-hosts" => { values.insert(arg.as_str(), iter.next().ok_or("missing configured update option value")?.clone()); }
             _ => return Err(format!("unknown configured update option {arg}")),
         }
     }
@@ -97,6 +103,15 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
         let session = expanded(&plan.session_command, &replacements);
         let (command, arguments) = session.split_first().ok_or("missing provider session command")?;
         return checked(Command::new(command).args(arguments).arg(&executable).arg("configured-deploy").args(args));
+    }
+    // Before anything is signed: a deployment from uncommitted changes is
+    // allowed, but only with the operator's explicit confirmation.
+    if let Some(directory) = local_flake_dir(installable) {
+        let git = values.get("--git").map(String::as_str).unwrap_or("git");
+        match dirty_files(git, &directory) {
+            Ok(files) => confirm_dirty_tree(&plan.host, &files, &expanded(&plan.confirm_command, &replacements))?,
+            Err(error) => eprintln!("nix-update-remote: cannot tell whether the tree is dirty: {error}"),
+        }
     }
     // Only a public SSH key is materialized, in a visible checkout directory.
     // Private signing material remains in the configured streaming provider.
@@ -140,9 +155,173 @@ pub fn deploy(args: &[String]) -> Result<(), String> {
     child.env("NIX_SSHOPTS", copy_arguments.iter().map(|v| quote(v)).collect::<Vec<_>>().join(" "));
     checked(&mut child)
 }
+/// The local directory a flake installable builds from, if it names one.
+fn local_flake_dir(installable: &str) -> Option<std::path::PathBuf> {
+    let reference = installable.split_once('#').map_or(installable, |(reference, _)| reference);
+    let reference = reference.split_once('?').map_or(reference, |(reference, _)| reference);
+    let path = ["path:", "git+file://", "git+file:"]
+        .iter()
+        .find_map(|scheme| reference.strip_prefix(scheme))
+        .unwrap_or(reference);
+    let local = path.is_empty() || path == "." || path == ".." || path.starts_with("./")
+        || path.starts_with("../") || path.starts_with('/');
+    local.then(|| std::path::PathBuf::from(if path.is_empty() { "." } else { path }))
+}
+
+/// Tracked files with uncommitted changes, staged or not, in the git tree
+/// of `directory`: exactly what a build from it takes but no commit holds.
+fn dirty_files(git: &str, directory: &std::path::Path) -> Result<Vec<String>, String> {
+    let output = Command::new(git)
+        .arg("-C").arg(directory)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=no"])
+        .stdin(std::process::Stdio::null())
+        .managed_output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    Ok(parse_porcelain(&output.stdout))
+}
+
+/// File names of `git status --porcelain=v1 -z` entries. A rename or copy
+/// is followed by its source, which is not listed again.
+fn parse_porcelain(output: &[u8]) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut entries = output.split(|byte| *byte == 0).filter(|entry| !entry.is_empty());
+    while let Some(entry) = entries.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        files.push(String::from_utf8_lossy(&entry[3..]).into_owned());
+        if matches!(entry[0], b'R' | b'C') || matches!(entry[1], b'R' | b'C') {
+            entries.next();
+        }
+    }
+    files
+}
+
+const RED: &str = "\x1b[1;31m";
+const RESET: &str = "\x1b[0m";
+
+/// Lets a deployment from a dirty tree go ahead only when the operator
+/// confirms it, naming every dirty file.
+fn confirm_dirty_tree(host: &str, files: &[String], command: &[String]) -> Result<(), String> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let reason = format!(
+        "{host} is about to be deployed from a working tree with {} uncommitted change{}. \
+         The build includes them, and no commit records them.",
+        files.len(),
+        if files.len() == 1 { "" } else { "s" }
+    );
+    eprintln!("{RED}WARNING: {reason}{RESET}");
+    for file in files {
+        eprintln!("{RED}  {file}{RESET}");
+    }
+    let confirmed = match command.split_first() {
+        Some((program, arguments)) => Command::new(program)
+            .args(arguments)
+            .arg("--reason")
+            .arg(&reason)
+            .args(files.iter().flat_map(|file| ["--item", file.as_str()]))
+            .stdin(std::process::Stdio::null())
+            .managed_status()
+            .is_ok_and(|status| status.success()),
+        None => confirm_on_terminal(),
+    };
+    if confirmed { Ok(()) } else { Err("the deployment from a dirty tree was not confirmed".into()) }
+}
+
+/// Asks on the controlling terminal; without one nothing is confirmed.
+fn confirm_on_terminal() -> bool {
+    use std::io::{BufRead, Write};
+    let Ok(terminal) = fs::OpenOptions::new().read(true).write(true).open("/dev/tty") else {
+        eprintln!("nix-update-remote: no terminal to confirm the deployment from a dirty tree");
+        return false;
+    };
+    let mut writer = &terminal;
+    let _ = write!(writer, "{RED}Deploy these uncommitted changes? Type yes to confirm: {RESET}");
+    let _ = writer.flush();
+    let mut answer = String::new();
+    std::io::BufReader::new(&terminal).read_line(&mut answer).is_ok() && answer.trim() == "yes"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_local_flakes_have_a_tree_to_check() {
+        for (installable, directory) in [
+            (".#nixosConfigurations.ns1", Some(".")),
+            ("#ns1", Some(".")),
+            ("./sub#a", Some("./sub")),
+            ("/home/op/flake#a", Some("/home/op/flake")),
+            ("path:/home/op/flake?dir=x#a", Some("/home/op/flake")),
+            ("git+file:///home/op/flake#a", Some("/home/op/flake")),
+            ("github:sirati/x#a", None),
+            ("nixpkgs#hello", None),
+        ] {
+            assert_eq!(local_flake_dir(installable).as_deref(), directory.map(std::path::Path::new), "{installable}");
+        }
+    }
+
+    #[test]
+    fn porcelain_lists_each_dirty_file_once() {
+        let output = b" M nix-secrets.toml\0M  server/a.nix\0R  new.nix\0old.nix\0A  added file.nix\0";
+        assert_eq!(parse_porcelain(output), ["nix-secrets.toml", "server/a.nix", "new.nix", "added file.nix"]);
+        assert!(parse_porcelain(b"").is_empty());
+    }
+
+    #[test]
+    fn a_dirty_tree_deploys_only_after_confirmation() {
+        let files = vec!["nix-secrets.toml".to_owned(), "server/a.nix".to_owned()];
+        assert_eq!(confirm_dirty_tree("ns1", &[], &["/nonexistent".into()]), Ok(()), "a clean tree asks nothing");
+        let directory = std::env::temp_dir().join(format!("nur-confirm-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let record = directory.join("arguments");
+        // A confirmer that records its arguments and answers with its exit status.
+        let confirmer = |code: i32| {
+            let script = directory.join(format!("confirm-{code}"));
+            fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit {code}\n", record.display())).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            vec![script.to_string_lossy().into_owned(), "procedure-confirm".into()]
+        };
+        assert_eq!(confirm_dirty_tree("ns1", &files, &confirmer(0)), Ok(()));
+        let arguments = fs::read_to_string(&record).unwrap();
+        let lines: Vec<_> = arguments.lines().collect();
+        assert_eq!(lines[0], "procedure-confirm");
+        assert_eq!(lines[1], "--reason");
+        assert!(lines[2].starts_with("ns1 is about to be deployed") && lines[2].contains("2 uncommitted changes"), "{arguments}");
+        assert_eq!(&lines[3..], ["--item", "nix-secrets.toml", "--item", "server/a.nix"]);
+        assert!(confirm_dirty_tree("ns1", &files, &confirmer(1)).is_err(), "a refusal stops the update");
+        assert!(confirm_dirty_tree("ns1", &files, &["/nonexistent/confirmer".into()]).is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_real_git_tree_reports_its_uncommitted_tracked_files() {
+        let git = std::env::var("NIX_UPDATE_TEST_GIT").unwrap_or_else(|_| "git".into());
+        let directory = std::env::temp_dir().join(format!("nur-dirty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let run = |args: &[&str]| {
+            assert!(Command::new(&git).arg("-C").arg(&directory)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args).status().unwrap().success(), "{args:?}");
+        };
+        run(&["init", "-q"]);
+        fs::write(directory.join("flake.nix"), "{}\n").unwrap();
+        run(&["add", "flake.nix"]);
+        run(&["commit", "-q", "-m", "init"]);
+        assert!(dirty_files(&git, &directory).unwrap().is_empty());
+        fs::write(directory.join("flake.nix"), "{ }\n").unwrap();
+        fs::write(directory.join("untracked.nix"), "{}\n").unwrap();
+        assert_eq!(dirty_files(&git, &directory).unwrap(), ["flake.nix"], "untracked files are not built");
+        let _ = fs::remove_dir_all(directory);
+    }
     #[test]
     fn substitutions_preserve_argument_boundaries() {
         let map = BTreeMap::from([("{target}", "update@::1".to_owned())]);
