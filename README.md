@@ -242,7 +242,9 @@ restored:
    a failure by itself. The gate rolls back on units that failed since the
    update began and still belong to the system, a failed health unit, a missing
    sshd, a new system that never became current, or a killed switch. Units that
-   were already failed before the update are reported as warnings.
+   were already failed before the update are reported as warnings. Units in
+   `health.ignoredUnits`, checks of outcomes a rollback cannot change, never
+   count as failed.
 3. Only then does the broker set the profile and run
    `switch-to-configuration boot`.
 4. Any failure on the way rolls back. The broker restores the profile link and,

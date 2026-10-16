@@ -35,6 +35,13 @@ pub fn settled_failures(
         .collect()
 }
 
+/// Failed units that count against an update: all but the ignored ones.
+/// Every decision of a transaction (watching the switch, the health gate,
+/// the repair and the verification of a rollback) reads failures from here.
+fn counted(failed: BTreeSet<String>, ignored: &BTreeSet<String>) -> BTreeSet<String> {
+    failed.into_iter().filter(|unit| !ignored.contains(unit)).collect()
+}
+
 pub struct SystemHost<'a> {
     pub nix_env: &'a Path,
     pub profile: &'a Path,
@@ -44,6 +51,9 @@ pub struct SystemHost<'a> {
     pub phase_file: &'a Path,
     pub ssh_ports: &'a [u16],
     pub health_units: &'a [String],
+    /// Units whose failure never counts against an update: checks of
+    /// outcomes a rollback cannot change. They report on their own.
+    pub ignored_units: &'a BTreeSet<String>,
     pub settle: Duration,
     pub health_timeout: Duration,
 }
@@ -348,7 +358,7 @@ impl Host for SystemHost<'_> {
     }
 
     fn failed_units(&self) -> Result<BTreeSet<String>, String> {
-        self.unit_list(&["--failed", "--all"])
+        Ok(counted(self.unit_list(&["--failed", "--all"])?, self.ignored_units))
     }
 
     fn running_services(&self) -> Result<BTreeSet<String>, String> {
@@ -464,6 +474,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ignored_units_never_count_as_failed() {
+        let failed = BTreeSet::from(["app.service".to_owned(), "outcome-check.service".to_owned()]);
+        let ignored = BTreeSet::from(["outcome-check.service".to_owned(), "other.service".to_owned()]);
+        assert_eq!(counted(failed.clone(), &ignored), BTreeSet::from(["app.service".to_owned()]));
+        assert_eq!(counted(failed.clone(), &BTreeSet::new()), failed);
+    }
+
+    #[test]
     fn only_listening_sockets_count() {
         let table = "  sl  local_address rem_address   st tx_queue rx_queue\n\
            0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000\n\
@@ -504,6 +522,7 @@ mod tests {
             phase_file: &directory.join("transaction-phase"),
             ssh_ports: &[],
             health_units: &[],
+            ignored_units: &BTreeSet::new(),
             settle: Duration::ZERO,
             health_timeout: Duration::ZERO,
         };

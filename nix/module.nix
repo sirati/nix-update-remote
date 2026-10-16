@@ -73,6 +73,17 @@ in
           failed before the update do not block it.
         '';
       };
+      ignoredUnits = lib.mkOption {
+        type = lib.types.listOf (lib.types.strMatching "[A-Za-z0-9:_.@\\\\-]+\\.[a-z]+");
+        default = [ ];
+        example = [ "backup-freshness.service" ];
+        description = ''
+          Units whose failure never counts against an update, before, during
+          or after the switch: checks of outcomes outside this system, such
+          as a late backup or an unreachable peer, which a rollback cannot
+          repair. They report their failures through their own channel.
+        '';
+      };
       settleSeconds = lib.mkOption {
         type = lib.types.ints.unsigned;
         default = 10;
@@ -291,6 +302,7 @@ in
             ++ lib.concatMap (arg: [ "--artifact-activate-arg" arg ]) ([ "activate-erofs" ] ++ artifactArgs)
           )
           ++ lib.concatMap (unit: [ "--health-unit" unit ]) cfg.health.units
+          ++ lib.concatMap (unit: [ "--ignore-failed-unit" unit ]) cfg.health.ignoredUnits
           ++ lib.concatMap (unit: [ "--commit-unit" unit ]) cfg.commitUnits
           ++ lib.optionals (cfg.commitUnits != [ ]) [ "--commit-units-pending" cfg.commitUnitsPendingFile ]
           ++ lib.concatMap (port: [ "--ssh-port" (toString port) ]) cfg.health.sshPorts

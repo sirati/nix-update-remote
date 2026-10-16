@@ -1,6 +1,7 @@
 use crate::system_host::SystemHost;
 use crate::transaction::{self, Events, Outcome};
 use crate::{protocol, verify};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
@@ -35,6 +36,7 @@ struct Options {
     phase_file: PathBuf,
     ssh_ports: Vec<u16>,
     health_units: Vec<String>,
+    ignored_units: BTreeSet<String>,
     health_settle: Duration,
     health_timeout: Duration,
     /// Units started, without waiting, after each committed closure switch.
@@ -55,6 +57,7 @@ impl Options {
             phase_file: &self.phase_file,
             ssh_ports: &self.ssh_ports,
             health_units: &self.health_units,
+            ignored_units: &self.ignored_units,
             settle: self.health_settle,
             health_timeout: self.health_timeout,
         })
@@ -310,6 +313,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let phase_file = PathBuf::from(protocol::PHASE_FILE);
     let mut ssh_ports = Vec::new();
     let mut health_units = Vec::new();
+    let mut ignored_units = BTreeSet::new();
     let mut health_settle = Duration::from_secs(10);
     let mut health_timeout = Duration::from_secs(600);
     let mut commit_units = Vec::new();
@@ -330,6 +334,13 @@ fn parse(args: &[String]) -> Result<Options, String> {
                     return Err("invalid health unit".into());
                 }
                 health_units.push(unit);
+            }
+            "--ignore-failed-unit" => {
+                let unit = next_value(&mut iter, arg)?;
+                if unit.starts_with('-') || unit.is_empty() || unit.contains(char::is_whitespace) {
+                    return Err("invalid ignored unit".into());
+                }
+                ignored_units.insert(unit);
             }
             "--health-settle-seconds" => {
                 health_settle = Duration::from_secs(
@@ -461,6 +472,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         phase_file,
         ssh_ports,
         health_units,
+        ignored_units,
         health_settle,
         health_timeout,
         commit_units,
@@ -914,6 +926,15 @@ mod tests {
         let (mut daemon_side, mut client) = UnixStream::pair().unwrap();
         client.write_all(protocol::ping_request().as_bytes()).unwrap();
         assert!(matches!(apply_request(&mut daemon_side, &other).0, Reply::Rejected(_)));
+    }
+
+    #[test]
+    fn ignored_failed_units_are_plain_unit_names() {
+        let parsed = options(&["--ignore-failed-unit", "backup-freshness.service"]).unwrap();
+        assert_eq!(parsed.ignored_units, BTreeSet::from(["backup-freshness.service".to_owned()]));
+        for bad in ["-x.service", "a b.service", ""] {
+            assert!(options(&["--ignore-failed-unit", bad]).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

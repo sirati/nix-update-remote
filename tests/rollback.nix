@@ -47,6 +47,8 @@ in
         beforeHooks = [ "${hook}/bin/update-hook-fixture" ];
         afterHooks = [ "${hook}/bin/update-hook-fixture" ];
         health.settleSeconds = 3;
+        # An outcome a rollback cannot change, such as a late backup.
+        health.ignoredUnits = [ "outcome-check.service" ];
       };
       services.openssh.enable = true;
       # /boot as on ns1: a separate vfat partition with the same options.
@@ -97,6 +99,14 @@ in
           imports = [ (generation "skew") ];
           services.nixUpdateRemote.package = skewedUpdater;
         };
+        # Adds a check of an outside outcome that fails at once.
+        outcome.configuration = {
+          imports = [ (generation "outcome") ];
+          systemd.services.outcome-check = {
+            wantedBy = [ "multi-user.target" ];
+            serviceConfig = { Type = "oneshot"; ExecStart = "${pkgs.coreutils}/bin/false"; };
+          };
+        };
         slow.configuration = {
           imports = [ (generation "slow") ];
           systemd.services.slow-gate = gate "/run/slow-gate-ready";
@@ -119,7 +129,7 @@ in
     def spec(name):
       return machine.succeed(f"readlink -f /run/current-system/specialisation/{name}").strip()
     base = machine.succeed("readlink -f /run/current-system").strip()
-    systems = {name: spec(name) for name in ["good", "broken", "bootfail", "stuck", "slow", "stillbroken", "skew"]}
+    systems = {name: spec(name) for name in ["good", "broken", "bootfail", "stuck", "slow", "stillbroken", "skew", "outcome"]}
 
     machine.succeed("install -d -m 0700 /run/update-ssh")
     client.succeed(
@@ -339,5 +349,15 @@ in
       machine.fail(f"systemd-run --wait --collect --quiet -p ProtectSystem=full ${boot}/bin/boot-fixture {current}")
       machine.succeed("journalctl -o cat | grep -F '/boot is not writable'")
       machine.succeed("findmnt -no OPTIONS /boot | grep -w rw")
+
+    with subtest("an ignored unit failing in the new system does not roll it back"):
+      reset_client()
+      client.succeed("touch /root/secrets-approve")
+      client.succeed(deploy("outcome"))
+      kept = state()
+      assert kept["current"] == systems["outcome"] and kept["boot"] == systems["outcome"], kept
+      assert machine.succeed("systemctl is-failed outcome-check.service").strip() == "failed"
+      client.succeed("test ! -e /root/failure-reports")
+      assert f"after success {systems['outcome']}" in events()
   '';
 }
