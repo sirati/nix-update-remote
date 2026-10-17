@@ -27,16 +27,32 @@ fn held_in(locks: &str, major: u32, minor: u32, inode: u64) -> bool {
     locked_inodes(locks).any(|id| id == (major, minor, inode))
 }
 
+/// How many consecutive scans of `/proc/locks` must miss a lock before it
+/// counts as released. Each read(2) of `/proc/locks` returns at most one
+/// page and the next resumes by entry number, so a lock some other process
+/// releases meanwhile shifts the list and an entry can be skipped. A busy
+/// host's list spans several pages.
+const RELEASED_AFTER_MISSES: usize = 3;
+
 /// Whether some process holds a lock on `lock`. A missing lock file is not
 /// held.
 pub fn held(lock: &Path) -> Result<bool, String> {
+    held_by(lock, || std::fs::read_to_string("/proc/locks").map_err(|e| format!("/proc/locks: {e}")))
+}
+
+fn held_by(lock: &Path, mut locks: impl FnMut() -> Result<String, String>) -> Result<bool, String> {
     let stat = match rustix::fs::stat(lock) {
         Ok(stat) => stat,
         Err(rustix::io::Errno::NOENT) => return Ok(false),
         Err(error) => return Err(format!("{}: {error}", lock.display())),
     };
-    let locks = std::fs::read_to_string("/proc/locks").map_err(|e| format!("/proc/locks: {e}"))?;
-    Ok(held_in(&locks, rustix::fs::major(stat.st_dev), rustix::fs::minor(stat.st_dev), stat.st_ino))
+    let (major, minor) = (rustix::fs::major(stat.st_dev), rustix::fs::minor(stat.st_dev));
+    for _ in 0..RELEASED_AFTER_MISSES {
+        if held_in(&locks()?, major, minor, stat.st_ino) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Waits until nobody holds `lock`, for at most `limit`.
@@ -92,6 +108,22 @@ mod tests {
         assert!(!held_in(locks, 0, 0x1a, 12346));
         assert!(!held_in(locks, 0, 0x1b, 12345));
         assert!(!held_in("", 0, 0x1a, 12345));
+    }
+
+    #[test]
+    fn a_scan_that_skips_the_held_lock_does_not_release_it() {
+        let lock = scratch("skip");
+        std::fs::File::create(&lock).unwrap();
+        let stat = rustix::fs::stat(&lock).unwrap();
+        let entry = format!("1: FLOCK  ADVISORY  WRITE 2410 {:02x}:{:02x}:{} 0 EOF\n",
+            rustix::fs::major(stat.st_dev), rustix::fs::minor(stat.st_dev), stat.st_ino);
+        // Like /proc/locks read while other locks come and go: one scan
+        // misses the entry, the next lists it.
+        let mut scans = ["2: POSIX  ADVISORY  READ 99 fd:01:42 0 EOF\n".to_owned(), entry].into_iter();
+        assert!(held_by(&lock, || Ok(scans.next().unwrap())).unwrap());
+        // Released for good only when every scan misses it.
+        assert!(!held_by(&lock, || Ok(String::new())).unwrap());
+        std::fs::remove_dir_all(lock.parent().unwrap()).unwrap();
     }
 
     #[test]
