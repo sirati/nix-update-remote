@@ -21,6 +21,8 @@ mod protocol;
 mod report_queue;
 mod ssh_login;
 mod verify;
+#[cfg(test)]
+mod test_support;
 
 use std::env;
 use std::process::ExitCode;

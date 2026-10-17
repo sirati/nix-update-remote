@@ -983,8 +983,7 @@ mod pending_tests {
     /// Options whose systemctl records its arguments and exits with `code`.
     fn options(directory: &Path, code: i32) -> Options {
         let systemctl = directory.join(format!("systemctl-{code}"));
-        fs::write(&systemctl, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nexit {code}\n", directory.join("started").display())).unwrap();
-        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::install_script(&systemctl, &format!("printf '%s\\n' \"$@\" >> {}\nexit {code}", directory.join("started").display()));
         let uid = rustix::process::getuid().as_raw().to_string();
         let pending = directory.join("var/commit-units-pending");
         let args: Vec<String> = [

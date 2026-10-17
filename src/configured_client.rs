@@ -369,9 +369,7 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let fake = |name: &str, body: &str| {
             let script = directory.join(name);
-            fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::install_script(&script, body);
             script.to_string_lossy().into_owned()
         };
         let failing = fake("failing-git", "echo 'fatal: not a git repository' >&2; exit 128");
@@ -396,9 +394,7 @@ mod tests {
         // A confirmer that records its arguments and answers with its exit status.
         let confirmer = |code: i32| {
             let script = directory.join(format!("confirm-{code}"));
-            fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit {code}\n", record.display())).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::install_script(&script, &format!("printf '%s\\n' \"$@\" > {}\nexit {code}", record.display()));
             vec![script.to_string_lossy().into_owned(), "procedure-confirm".into()]
         };
         assert_eq!(confirm_dirty_tree("ns1", &files, &confirmer(0)), Ok(()));
