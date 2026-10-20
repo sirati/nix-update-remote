@@ -327,6 +327,11 @@ in
     systemd.services.nix-update-remote-probe = lib.mkIf cfg.probe.enable {
       description = "Probe the update path through the update account's login program";
       after = [ "nix-update-remote.service" ];
+      # An update never restarts a running probe: its ping waits for the
+      # broker, which answers only once that update is done, so the switch
+      # would hang on it until the probe times out and roll back. The probe
+      # in flight finishes after the update; its timer starts the new one.
+      restartIfChanged = false;
       serviceConfig = {
         Type = "oneshot";
         User = cfg.user;

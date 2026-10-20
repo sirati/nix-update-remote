@@ -94,6 +94,11 @@ in
           };
         };
         old-key.configuration.environment.etc."remote-update-generation".text = "old-key";
+        # The probe unit changes, as with every updater build.
+        probe-changed.configuration = {
+          environment.etc."remote-update-generation".text = "probe-changed";
+          systemd.services.nix-update-remote-probe.environment.PROBE_TEST_GENERATION = "changed";
+        };
       };
       system.stateVersion = "26.05";
     };
@@ -142,6 +147,7 @@ in
     failed = machine.succeed("readlink -f /run/current-system/specialisation/failed").strip()
     gated = machine.succeed("readlink -f /run/current-system/specialisation/gated").strip()
     old_key = machine.succeed("readlink -f /run/current-system/specialisation/old-key").strip()
+    probe_changed = machine.succeed("readlink -f /run/current-system/specialisation/probe-changed").strip()
 
     machine.succeed(
       f"runuser -u update -- ${pkgs.python3}/bin/python3 ${wrongPeer} {first}"
@@ -365,6 +371,28 @@ in
     client.succeed(f"{retry_command} {second}")
     machine.succeed("grep -Fx second /etc/remote-update-generation")
     machine.wait_until_succeeds("grep -zq UPDATE_TEST_GENERATION=second /proc/$(systemctl show nix-update-remote.service -p MainPID --value)/environ")
+
+    # An update that changes the probe while a probe runs. Restarting it
+    # would wait for a ping the broker answers only after this very
+    # update, until the probe times out and the update rolls back.
+    # A probe its timer started just before: held at its start, as one
+    # waiting out another update is; the hold is gone before the switch.
+    machine.succeed(
+      "mkdir -p /run/systemd/system/nix-update-remote-probe.service.d",
+      "printf '[Service]\\nExecStartPre=${pkgs.coreutils}/bin/sleep 600\\n' > /run/systemd/system/nix-update-remote-probe.service.d/hold.conf",
+      "systemctl daemon-reload",
+      "systemctl start --no-block nix-update-remote-probe.service",
+    )
+    machine.wait_until_succeeds("test $(systemctl show nix-update-remote-probe.service -p ActiveState --value) = activating")
+    machine.succeed("rm -r /run/systemd/system/nix-update-remote-probe.service.d", "systemctl daemon-reload")
+    machine.succeed("test $(systemctl show nix-update-remote-probe.service -p ActiveState --value) = activating")
+    machine.succeed(f"nix --extra-experimental-features nix-command store sign -r --key-file /run/update-signing-b {probe_changed}")
+    client.succeed(f"NIX_SSHOPTS='{nix_ssh_b}' nix --extra-experimental-features nix-command --option trusted-public-keys {shlex.quote(trusted_copy_key)} copy --from ssh-ng://update@machine {probe_changed}")
+    client.succeed("timeout 300 sh -c " + shlex.quote(f"{retry_command} {probe_changed}"))
+    machine.succeed("grep -Fx probe-changed /etc/remote-update-generation")
+    machine.succeed(f"test $(readlink /run/current-system) = {probe_changed}")
+    # The probe in flight is the old one; it is left to finish.
+    machine.fail("journalctl -u nix-update-remote.service --no-pager | grep -F 'stopping the following units: nix-update-remote-probe.service'")
 
     machine.succeed(
       "shred -u /run/update-signing-a /run/update-signing-b",
